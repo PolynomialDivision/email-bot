@@ -23,7 +23,7 @@ mod matrix_reply;
 mod smtp_send;
 mod verify;
 
-use config::{Config, Secrets, parse_admin_users, parse_allowed_inviters, parse_allowed_repliers};
+use config::{Config, Secrets, parse_admin_users, parse_allowed_inviters, parse_allowed_repliers, parse_allowed_rooms};
 use db::Db;
 use email::{ParsedEmail, RawEmail};
 use verify::BotState;
@@ -131,7 +131,10 @@ async fn main() -> Result<()> {
 
     // Destructure security config all at once to avoid partial-move issues
     let admin_users = parse_admin_users(&config.security);
-    let allowed_inviters = parse_allowed_inviters(&config.security);
+    let allowed_inviters = parse_allowed_inviters(&config.security)
+        .context("Invalid allowed_inviters in [security] config")?;
+    let allowed_rooms = parse_allowed_rooms(&config.security)
+        .context("Invalid allowed_rooms in [security] config")?;
     let allowed_repliers = parse_allowed_repliers(&config.security);
     let strategy: CollectStrategy = config.security.encryption_strategy.into();
     info!(strategy = ?strategy, "Encryption strategy configured");
@@ -224,19 +227,31 @@ async fn main() -> Result<()> {
         );
     }
 
-    if allowed_inviters.is_empty() {
-        warn!("No allowed_inviters configured — bot will accept invites from anyone");
+    if allowed_inviters.is_deny_all() {
+        warn!("allowed_inviters = [] — bot will reject all invites");
+    } else if allowed_inviters.is_allow_all() {
+        warn!("allowed_inviters = \"all\" — bot will accept invites from any Matrix user");
     } else {
         info!(
-            count = allowed_inviters.len(),
-            inviters = ?allowed_inviters,
-            "Allowed inviters configured"
+            count = allowed_inviters.explicit_count().unwrap_or(0),
+            "Allowed inviters configured (explicit list)"
+        );
+    }
+    if allowed_rooms.is_deny_all() {
+        warn!("allowed_rooms = [] — bot will not operate in any room");
+    } else if allowed_rooms.is_allow_all() {
+        info!("allowed_rooms = \"all\" — bot will operate in any joined room");
+    } else {
+        info!(
+            count = allowed_rooms.explicit_count().unwrap_or(0),
+            "Allowed rooms configured (explicit list)"
         );
     }
 
     let bot_state = BotState {
         bot_user_id: user_id.clone(),
-        allowed_inviters,
+        allowed_inviters: allowed_inviters.clone(),
+        allowed_rooms: allowed_rooms.clone(),
         admin_users,
         reset_allowed: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
     };
@@ -313,9 +328,21 @@ async fn main() -> Result<()> {
         if invited.is_empty() {
             debug!("No pending invites after initial sync");
         } else {
-            info!(count = invited.len(), "Pending invite(s) found after initial sync — joining");
+            info!(count = invited.len(), "Pending invite(s) found after initial sync — processing");
             for room in invited {
                 let room_id = room.room_id().to_owned();
+                // Inviter info is unavailable when replaying from the store.
+                // Decline all if configured; otherwise can only check room.
+                if allowed_inviters.is_deny_all() {
+                    warn!(room_id = %room_id, "Pending invite declined: allowed_inviters = []");
+                    room.leave().await.ok();
+                    continue;
+                }
+                if !allowed_rooms.allows(&room_id) {
+                    warn!(room_id = %room_id, "Pending invite declined: room not in allowed_rooms");
+                    room.leave().await.ok();
+                    continue;
+                }
                 // Build via servers from the room ID's server (inviter server is unavailable
                 // here since we're replaying from the store, not a live event).
                 let via: Vec<OwnedServerName> = room_id
@@ -351,6 +378,17 @@ async fn main() -> Result<()> {
                 "Bot is not in any rooms — emails will be fetched but cannot be posted. \
                  Invite the bot to a Matrix room."
             );
+        }
+        if !allowed_rooms.is_allow_all() {
+            for room in &rooms {
+                if !allowed_rooms.allows(room.room_id()) {
+                    warn!(
+                        room_id = %room.room_id(),
+                        name = ?room.name(),
+                        "Bot is joined to a room not in allowed_rooms — consider leaving it"
+                    );
+                }
+            }
         }
     }
 

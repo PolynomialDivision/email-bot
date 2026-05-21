@@ -23,7 +23,17 @@ list_id = "mylist.example.com"               # partial match on List-Id header
 
 [security]
 admin_users = ["@you:matrix.org"]
+# Who may invite the bot:
+#   "all"                      — accept invites from any Matrix user
+#   []                         — reject all invites
+#   ["@you:matrix.org"]        — explicit allowlist
 allowed_inviters = ["@you:matrix.org"]
+# Rooms the bot may join and bridge emails into:
+#   "all"                      — operate in any room
+#   []                         — refuse to operate in any room
+#   ["!roomid:matrix.org"]     — explicit allowlist
+# Both allowed_inviters and allowed_rooms must pass before an invite is accepted.
+allowed_rooms = "all"
 encryption_strategy = "all_devices"
 # Matrix users allowed to send email replies via the bridge.
 # If empty (or absent), all room members may reply.

@@ -19,10 +19,13 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
+use crate::config::{RoomAllowList, UserAllowList};
+
 #[derive(Clone)]
 pub struct BotState {
     pub bot_user_id: OwnedUserId,
-    pub allowed_inviters: HashSet<OwnedUserId>,
+    pub allowed_inviters: UserAllowList,
+    pub allowed_rooms: RoomAllowList,
     pub admin_users: HashSet<OwnedUserId>,
     pub reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
 }
@@ -37,13 +40,20 @@ pub fn register_handlers(client: &Client, state: BotState) {
                 if ev.state_key != state.bot_user_id {
                     return;
                 }
-                if !state.allowed_inviters.is_empty()
-                    && !state.allowed_inviters.contains(&ev.sender)
-                {
+                if !state.allowed_inviters.allows(&ev.sender) {
                     warn!(
                         room_id = %room.room_id(),
                         sender = %ev.sender,
-                        "Rejecting invite (sender not in allowed_inviters)"
+                        "Rejecting invite: inviter not in allowed_inviters"
+                    );
+                    room.leave().await.ok();
+                    return;
+                }
+                if !state.allowed_rooms.allows(room.room_id()) {
+                    warn!(
+                        room_id = %room.room_id(),
+                        sender = %ev.sender,
+                        "Rejecting invite: room not in allowed_rooms"
                     );
                     room.leave().await.ok();
                     return;

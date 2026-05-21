@@ -112,12 +112,79 @@ impl From<EncryptionStrategy> for matrix_sdk_crypto::CollectStrategy {
     }
 }
 
+// Serde helper: deserializes either the string "all" or a list of strings.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub(crate) enum RawAllowList {
+    Wildcard(String),
+    List(Vec<String>),
+}
+impl Default for RawAllowList {
+    fn default() -> Self {
+        RawAllowList::Wildcard("all".to_owned())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum UserAllowList {
+    All,
+    Deny,
+    Explicit(HashSet<matrix_sdk::ruma::OwnedUserId>),
+}
+impl UserAllowList {
+    pub fn allows(&self, user: &matrix_sdk::ruma::OwnedUserId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Deny => false,
+            Self::Explicit(set) => set.contains(user),
+        }
+    }
+    pub fn is_allow_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+    pub fn is_deny_all(&self) -> bool {
+        matches!(self, Self::Deny)
+    }
+    pub fn explicit_count(&self) -> Option<usize> {
+        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RoomAllowList {
+    All,
+    Deny,
+    Explicit(HashSet<matrix_sdk::ruma::OwnedRoomId>),
+}
+impl RoomAllowList {
+    pub fn allows(&self, room_id: &matrix_sdk::ruma::RoomId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Deny => false,
+            Self::Explicit(set) => set.contains(room_id),
+        }
+    }
+    pub fn is_allow_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+    pub fn is_deny_all(&self) -> bool {
+        matches!(self, Self::Deny)
+    }
+    pub fn explicit_count(&self) -> Option<usize> {
+        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// "all" = accept invites from any user; [] = reject all invites; explicit list = allowlist.
     #[serde(default)]
-    pub allowed_inviters: Vec<String>,
+    pub allowed_inviters: RawAllowList,
+    /// "all" = operate in any room; [] = operate in no room; explicit list = allowlist.
+    #[serde(default)]
+    pub allowed_rooms: RawAllowList,
     /// Matrix users allowed to send email replies via the bridge.
     /// Empty means all room members may reply.
     #[serde(default)]
@@ -175,14 +242,50 @@ pub fn parse_admin_users(
         .collect()
 }
 
-pub fn parse_allowed_inviters(
-    security: &SecurityConfig,
-) -> HashSet<matrix_sdk::ruma::OwnedUserId> {
-    security
-        .allowed_inviters
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect()
+pub fn parse_allowed_inviters(security: &SecurityConfig) -> Result<UserAllowList> {
+    match &security.allowed_inviters {
+        RawAllowList::Wildcard(s) if s == "all" => Ok(UserAllowList::All),
+        RawAllowList::Wildcard(s) => anyhow::bail!(
+            "Invalid allowed_inviters value: {:?} (expected \"all\" or a list of Matrix user IDs)",
+            s
+        ),
+        RawAllowList::List(list) if list.is_empty() => Ok(UserAllowList::Deny),
+        RawAllowList::List(list) => {
+            let mut set = HashSet::new();
+            for s in list {
+                let uid = s
+                    .parse::<matrix_sdk::ruma::OwnedUserId>()
+                    .with_context(|| {
+                        format!("Invalid Matrix user ID in allowed_inviters: {:?}", s)
+                    })?;
+                set.insert(uid);
+            }
+            Ok(UserAllowList::Explicit(set))
+        }
+    }
+}
+
+pub fn parse_allowed_rooms(security: &SecurityConfig) -> Result<RoomAllowList> {
+    match &security.allowed_rooms {
+        RawAllowList::Wildcard(s) if s == "all" => Ok(RoomAllowList::All),
+        RawAllowList::Wildcard(s) => anyhow::bail!(
+            "Invalid allowed_rooms value: {:?} (expected \"all\" or a list of Matrix room IDs)",
+            s
+        ),
+        RawAllowList::List(list) if list.is_empty() => Ok(RoomAllowList::Deny),
+        RawAllowList::List(list) => {
+            let mut set = HashSet::new();
+            for s in list {
+                let rid = s
+                    .parse::<matrix_sdk::ruma::OwnedRoomId>()
+                    .with_context(|| {
+                        format!("Invalid Matrix room ID in allowed_rooms: {:?}", s)
+                    })?;
+                set.insert(rid);
+            }
+            Ok(RoomAllowList::Explicit(set))
+        }
+    }
 }
 
 pub fn parse_allowed_repliers(
