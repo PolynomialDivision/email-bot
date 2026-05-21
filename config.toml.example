@@ -1,0 +1,46 @@
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@emailbot:matrix.org"
+access_token = "YOUR_ACCESS_TOKEN"
+device_id = "YOUR_DEVICE_ID"
+# recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+
+[imap]
+host = "mail.example.com"
+port = 993
+username = "bot@example.com"
+# password loaded from IMAP_PASSWORD env var
+mailbox = "INBOX"
+poll_interval_secs = 60
+initial_fetch_limit = 50
+skip_initial_history = true  # don't flood Matrix on first run
+
+[mailing_list]
+list_id = "mylist.example.com"               # partial match on List-Id header
+# sender_domains = ["lists.example.com"]     # fallback if no List-Id
+# sender_emails = ["listname@example.com"]   # exact sender match
+# subject_prefix = "[mylist]"               # subject prefix filter
+
+[security]
+admin_users = ["@you:matrix.org"]
+allowed_inviters = ["@you:matrix.org"]
+encryption_strategy = "all_devices"
+# Matrix users allowed to send email replies via the bridge.
+# If empty (or absent), all room members may reply.
+# allowed_repliers = ["@you:matrix.org"]
+
+# Optional: enable Matrix → Email reply bridging.
+# Remove this section entirely to run in read-only (Email → Matrix only) mode.
+[smtp]
+host = "smtp.example.com"
+port = 587               # 587 for STARTTLS (default), 465 for SMTPS
+username = "bot@example.com"
+# password loaded from SMTP_PASSWORD env var
+from_address = "bot@example.com"   # address in the From header of bridge replies
+list_address = "list@lists.example.com"  # mailing list posting address (To + Reply-To)
+# require_smtps = false  # set true if your server requires implicit TLS on port 465
+
+[limits]
+max_attachment_bytes = 10485760  # 10MB
+max_body_bytes = 524288          # 512KB
+max_quote_lines = 5

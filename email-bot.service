@@ -1,0 +1,26 @@
+[Unit]
+Description=Email-to-Matrix bridge bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=email-bot
+WorkingDirectory=/opt/email-bot
+EnvironmentFile=/opt/email-bot/.env
+Environment=STORE_PATH=/opt/email-bot/store
+ExecStart=/usr/local/bin/email-bot /opt/email-bot/config.toml
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=email-bot
+
+# Harden the service
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/email-bot/store
+
+[Install]
+WantedBy=multi-user.target

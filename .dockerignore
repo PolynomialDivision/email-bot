@@ -1,0 +1,5 @@
+.git
+target
+store
+config.toml
+.env

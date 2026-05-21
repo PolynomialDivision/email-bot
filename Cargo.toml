@@ -1,0 +1,34 @@
+[package]
+name = "email-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "email-bot"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+mail-parser = "0.11"
+matrix-sdk = { version = "0.17", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.17"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+ammonia = "4"
+html2text = "0.17"
+bytes = "1"
+base64 = "0.22"
+mime = "0.3"
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+uuid = { version = "1", features = ["v4"] }

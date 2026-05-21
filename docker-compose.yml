@@ -1,0 +1,11 @@
+services:
+  email-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./store:/app/store
+      - ./config:/app/config
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - STORE_PATH=/app/store
