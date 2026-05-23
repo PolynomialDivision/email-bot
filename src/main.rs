@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
     let limits_config = config.limits;
 
     let db_imap = db.clone();
-    let imap_handle = spawn_task("imap_sync", async move {
+    let _imap_handle = spawn_task("imap_sync", async move {
         imap_sync::imap_loop(imap_config, imap_password, tx, db_imap).await;
     });
 
@@ -410,7 +410,7 @@ async fn main() -> Result<()> {
     let client_sender = client.clone();
     let limits_sender = limits_config.clone();
     let mailing_list_sender = mailing_list_config.clone();
-    let send_handle = spawn_task("matrix_send", async move {
+    let _send_handle = spawn_task("matrix_send", async move {
         matrix_send_loop(
             client_sender,
             rx,
@@ -422,18 +422,18 @@ async fn main() -> Result<()> {
     });
 
     let db_cleanup = db.clone();
-    let cleanup_handle = spawn_task("cleanup", async move {
+    let _cleanup_handle = spawn_task("cleanup", async move {
         cleanup_loop(db_cleanup).await;
     });
 
     let db_retry = db.clone();
     let client_retry = client.clone();
     let limits_retry = limits_config.clone();
-    let retry_handle = spawn_task("email_retry", async move {
+    let _retry_handle = spawn_task("email_retry", async move {
         retry_loop(client_retry, db_retry, limits_retry).await;
     });
 
-    let smtp_retry_handle = if let (Some(smtp_cfg), Some(smtp_pw)) =
+    let _smtp_retry_handle = if let (Some(smtp_cfg), Some(smtp_pw)) =
         (smtp_config_opt, secrets.smtp_password.clone())
     {
         info!("Spawning SMTP retry worker");
