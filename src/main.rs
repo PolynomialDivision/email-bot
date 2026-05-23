@@ -455,22 +455,13 @@ async fn main() -> Result<()> {
 
     info!("All background tasks spawned — entering Matrix continuous sync loop");
     let sync_filter = FilterDefinition::with_lazy_loading();
-    let sync_result = client
-        .sync(SyncSettings::default().filter(sync_filter.into()))
-        .await
-        .context("Matrix sync loop terminated");
-
-    // sync() should block forever; reaching here is unexpected.
-    warn!("Matrix sync loop exited unexpectedly");
-    imap_handle.abort();
-    send_handle.abort();
-    cleanup_handle.abort();
-    if let Some(h) = smtp_retry_handle {
-        h.abort();
+    loop {
+        match client.sync(SyncSettings::default().filter(sync_filter.clone().into())).await {
+            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
+            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
+        }
+        sleep(Duration::from_secs(5)).await;
     }
-    retry_handle.abort();
-
-    sync_result
 }
 
 fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::path::Path) {
