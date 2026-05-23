@@ -32,3 +32,4 @@ base64 = "0.22"
 mime = "0.3"
 lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
 uuid = { version = "1", features = ["v4"] }
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }

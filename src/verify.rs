@@ -1,9 +1,5 @@
-use futures_util::StreamExt;
 use matrix_sdk::{
     Client, Room, RoomState,
-    encryption::verification::{
-        SasState, Verification, VerificationRequest, VerificationRequestState,
-    },
     ruma::{
         OwnedServerName, OwnedUserId, RoomOrAliasId,
         events::{
@@ -93,7 +89,7 @@ pub fn register_handlers(client: &Client, state: BotState) {
                                 info!(room_id = %room_id, "Joined room");
                                 return;
                             }
-                            Err(ref e) if is_join_terminal(e) => {
+                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
                                 warn!(
                                     room_id = %room_id,
                                     error = %e,
@@ -141,7 +137,11 @@ pub fn register_handlers(client: &Client, state: BotState) {
                     warn!("to-device verification request object not found");
                     return;
                 };
-                tokio::spawn(handle_verification_request(client, state, request));
+                tokio::spawn(mxbot_common::verify::handle_verification_request(
+                    client,
+                    Arc::clone(&state.reset_allowed),
+                    request,
+                ));
             }
         }
     });
@@ -161,7 +161,11 @@ pub fn register_handlers(client: &Client, state: BotState) {
                         warn!("in-room verification request object not found");
                         return;
                     };
-                    tokio::spawn(handle_verification_request(client, state, request));
+                    tokio::spawn(mxbot_common::verify::handle_verification_request(
+                        client,
+                        Arc::clone(&state.reset_allowed),
+                        request,
+                    ));
                     return;
                 }
 
@@ -197,135 +201,3 @@ pub fn register_handlers(client: &Client, state: BotState) {
     });
 }
 
-pub async fn handle_verification_request(
-    client: Client,
-    state: BotState,
-    request: VerificationRequest,
-) {
-    let user_id = request.other_user_id();
-
-    let already_verified = client
-        .encryption()
-        .get_user_devices(user_id)
-        .await
-        .map(|devices| devices.devices().any(|d| d.is_verified()))
-        .unwrap_or(false);
-
-    if already_verified {
-        let allowed = state.reset_allowed.lock().await.remove(user_id);
-        if !allowed {
-            warn!(
-                "Rejecting verification from {} — already has a verified device",
-                user_id
-            );
-            request.cancel().await.ok();
-            return;
-        }
-        info!(
-            "Allowing re-verification for {} (trust was reset by admin)",
-            user_id
-        );
-    }
-
-    info!("Accepting verification from {user_id}");
-    if let Err(e) = request.accept().await {
-        error!("Failed to accept verification request: {e}");
-        return;
-    }
-
-    let mut stream = request.changes();
-    while let Some(state) = stream.next().await {
-        match state {
-            VerificationRequestState::Transitioned { verification } => {
-                if let Verification::SasV1(sas) = verification {
-                    tokio::spawn(handle_sas(sas));
-                    break;
-                }
-            }
-            VerificationRequestState::Done | VerificationRequestState::Cancelled(_) => break,
-            _ => {}
-        }
-    }
-}
-
-async fn handle_sas(sas: matrix_sdk::encryption::verification::SasVerification) {
-    info!(
-        "SAS with {} {}",
-        sas.other_device().user_id(),
-        sas.other_device().device_id()
-    );
-
-    if let Err(e) = sas.accept().await {
-        error!("Failed to accept SAS: {e}");
-        return;
-    }
-
-    let mut stream = sas.changes();
-    while let Some(state) = stream.next().await {
-        match state {
-            SasState::KeysExchanged { .. } => {
-                info!("Auto-confirming emojis");
-                if let Err(e) = sas.confirm().await {
-                    error!("SAS confirm failed: {e}");
-                    break;
-                }
-            }
-            SasState::Done { .. } => {
-                info!(
-                    "Verification done: {} {}",
-                    sas.other_device().user_id(),
-                    sas.other_device().device_id()
-                );
-                break;
-            }
-            SasState::Cancelled(info) => {
-                warn!("Verification cancelled: {}", info.reason());
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-pub async fn bootstrap_cross_signing(client: &Client, user_id: &OwnedUserId) {
-    // If recovery already restored all three cross-signing keys, skip the upload.
-    // On matrix.org the upload requires UIA (m.oauth) which a headless bot cannot
-    // complete — calling bootstrap when the keys are already present just generates
-    // a noisy 401 on every startup with no benefit.
-    if let Some(status) = client.encryption().cross_signing_status().await {
-        if status.has_master && status.has_self_signing && status.has_user_signing {
-            info!(
-                user_id = %user_id,
-                "Cross-signing already complete (keys present) — skipping bootstrap"
-            );
-            return;
-        }
-        info!(
-            user_id = %user_id,
-            has_master = status.has_master,
-            has_self_signing = status.has_self_signing,
-            has_user_signing = status.has_user_signing,
-            "Cross-signing incomplete — attempting bootstrap"
-        );
-    }
-    match client.encryption().bootstrap_cross_signing(None).await {
-        Ok(()) => info!(user_id = %user_id, "Cross-signing bootstrapped successfully"),
-        Err(e) => warn!(
-            user_id = %user_id,
-            error = %e,
-            "Cross-signing bootstrap failed (non-fatal — bot can still send/receive messages)"
-        ),
-    }
-}
-
-/// Returns true for join errors that will not resolve with a retry.
-fn is_join_terminal(e: &matrix_sdk::Error) -> bool {
-    let s = e.to_string();
-    // 404 "No known servers" — room unreachable via federation even with via hints
-    // M_FORBIDDEN — bot is banned from the room
-    // M_UNKNOWN_TOKEN — access token is invalid
-    s.contains("No known servers")
-        || s.contains("M_FORBIDDEN")
-        || s.contains("M_UNKNOWN_TOKEN")
-        || s.contains("M_GUEST_ACCESS_FORBIDDEN")
-}

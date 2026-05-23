@@ -2,12 +2,10 @@ use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
-    Client, SessionMeta, SessionTokens,
-    authentication::matrix::MatrixSession,
+    Client,
     config::SyncSettings,
-    ruma::{OwnedDeviceId, OwnedServerName, OwnedUserId, RoomOrAliasId, api::client::filter::FilterDefinition},
+    ruma::{OwnedServerName, RoomOrAliasId, api::client::filter::FilterDefinition},
 };
-use matrix_sdk_crypto::CollectStrategy;
 use serde_json;
 use tokio::{fs, signal, sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
@@ -136,8 +134,8 @@ async fn main() -> Result<()> {
     let allowed_rooms = parse_allowed_rooms(&config.security)
         .context("Invalid allowed_rooms in [security] config")?;
     let allowed_repliers = parse_allowed_repliers(&config.security);
-    let strategy: CollectStrategy = config.security.encryption_strategy.into();
-    info!(strategy = ?strategy, "Encryption strategy configured");
+    let encryption_strategy = config.security.encryption_strategy;
+    info!(strategy = ?encryption_strategy, "Encryption strategy configured");
 
     info!(
         homeserver = %config.matrix.homeserver,
@@ -146,76 +144,13 @@ async fn main() -> Result<()> {
         store_path = %store_path.display(),
         "Building Matrix client"
     );
-    let t_build = std::time::Instant::now();
-    let client = Client::builder()
-        .homeserver_url(&config.matrix.homeserver)
-        .sqlite_store(&store_path, None)
-        .with_room_key_recipient_strategy(strategy)
-        .build()
-        .await
-        .with_context(|| {
-            format!(
-                "Building Matrix client for homeserver {}",
-                config.matrix.homeserver
-            )
-        })?;
-    info!(
-        elapsed_ms = t_build.elapsed().as_millis(),
-        "Matrix client built"
-    );
-
-    let user_id: OwnedUserId = config
-        .matrix
-        .user_id
-        .parse()
-        .context("Parsing matrix user_id — must be in @user:server format")?;
-    let device_id: OwnedDeviceId = OwnedDeviceId::from(config.matrix.device_id.clone());
-
-    info!(user_id = %user_id, device_id = %config.matrix.device_id, "Restoring Matrix session");
-    let t_session = std::time::Instant::now();
-    client
-        .restore_session(MatrixSession {
-            meta: SessionMeta {
-                user_id: user_id.clone(),
-                device_id,
-            },
-            tokens: SessionTokens {
-                access_token: config.matrix.access_token.clone(),
-                refresh_token: None,
-            },
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "Restoring Matrix session for {} — check access_token and device_id in config",
-                user_id
-            )
-        })?;
-    info!(
-        user_id = %user_id,
-        elapsed_ms = t_session.elapsed().as_millis(),
-        "Matrix session restored successfully"
-    );
-
-    // Recover cross-signing keys from backup if configured
-    if let Some(ref key) = config.matrix.recovery_key {
-        info!("Recovery key configured — recovering cross-signing keys from backup");
-        let t_recover = std::time::Instant::now();
-        match client.encryption().recovery().recover(key).await {
-            Ok(()) => info!(
-                elapsed_ms = t_recover.elapsed().as_millis(),
-                "Cross-signing keys recovered successfully"
-            ),
-            Err(e) => warn!(
-                error = %e,
-                elapsed_ms = t_recover.elapsed().as_millis(),
-                "Cross-signing key recovery failed (non-fatal — encryption may degrade)"
-            ),
-        }
-    } else {
-        debug!("No recovery_key in config — skipping cross-signing recovery");
-    }
-    verify::bootstrap_cross_signing(&client, &user_id).await;
+    let (client, user_id) = mxbot_common::session::build_and_restore(
+        &config.matrix,
+        &store_path,
+        encryption_strategy.into(),
+    )
+    .await
+    .context("Matrix client setup failed")?;
 
     if admin_users.is_empty() {
         warn!("No admin_users configured — !reset-trust command is disabled");

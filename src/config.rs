@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 
+pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig};
+
 #[derive(Deserialize)]
 pub struct Config {
     pub matrix: MatrixConfig,
@@ -12,15 +14,6 @@ pub struct Config {
     #[serde(default)]
     pub limits: LimitsConfig,
     pub smtp: Option<SmtpConfig>,
-}
-
-#[derive(Deserialize)]
-pub struct MatrixConfig {
-    pub homeserver: String,
-    pub user_id: String,
-    pub access_token: String,
-    pub device_id: String,
-    pub recovery_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -84,31 +77,6 @@ impl LimitsConfig {
 
     pub fn effective_max_quote_lines(&self) -> usize {
         self.max_quote_lines.unwrap_or(5)
-    }
-}
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum EncryptionStrategy {
-    AllDevices,
-    #[default]
-    IdentityBased,
-    OnlyTrusted,
-}
-
-impl From<EncryptionStrategy> for matrix_sdk_crypto::CollectStrategy {
-    fn from(s: EncryptionStrategy) -> Self {
-        match s {
-            EncryptionStrategy::AllDevices => {
-                matrix_sdk_crypto::CollectStrategy::AllDevices
-            }
-            EncryptionStrategy::IdentityBased => {
-                matrix_sdk_crypto::CollectStrategy::IdentityBasedStrategy
-            }
-            EncryptionStrategy::OnlyTrusted => {
-                matrix_sdk_crypto::CollectStrategy::OnlyTrustedDevices
-            }
-        }
     }
 }
 
