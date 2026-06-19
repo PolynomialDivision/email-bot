@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use base64::Engine;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use lettre::address::{Address, Envelope};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -19,8 +19,10 @@ pub struct SmtpReply {
     #[serde(default)]
     pub sender_matrix_id: String,
     /// Email Message-Id being directly replied to (stripped of angle brackets).
+    #[serde(default)]
     pub in_reply_to: String,
     /// Older ancestor Message-Ids for the References header (oldest first, stripped).
+    #[serde(default)]
     pub references: Vec<String>,
     pub subject: String,
     pub body: String,
@@ -48,6 +50,28 @@ impl SmtpReply {
             our_message_id,
         }
     }
+
+    pub fn new_thread(
+        display_name: String,
+        sender_matrix_id: String,
+        subject: String,
+        body: String,
+    ) -> Self {
+        let our_message_id = format!("{}@email-bridge.local", Uuid::new_v4());
+        Self {
+            display_name,
+            sender_matrix_id,
+            in_reply_to: String::new(),
+            references: Vec::new(),
+            subject,
+            body,
+            our_message_id,
+        }
+    }
+
+    pub fn is_thread_reply(&self) -> bool {
+        !self.in_reply_to.trim().is_empty()
+    }
 }
 
 pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) -> Result<()> {
@@ -65,24 +89,29 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
         from_address = %config.from_address,
         to = %config.list_address,
         message_id = %reply.our_message_id,
-        in_reply_to = %reply.in_reply_to,
+        in_reply_to = if reply.is_thread_reply() { reply.in_reply_to.as_str() } else { "" },
         subject = %reply.subject,
         display_name = %reply.display_name,
-        "SMTP: sending reply"
+        is_thread_reply = reply.is_thread_reply(),
+        "SMTP: sending Matrix-originated email"
     );
 
     debug!("SMTP: building raw RFC 2822 message");
     let raw = build_raw_email(config, reply)?;
     debug!(raw_bytes = raw.len(), "SMTP: raw message built");
 
-    let from_addr: Address = config
-        .from_address
-        .parse()
-        .with_context(|| format!("SMTP: parsing from_address '{}' failed", config.from_address))?;
-    let list_addr: Address = config
-        .list_address
-        .parse()
-        .with_context(|| format!("SMTP: parsing list_address '{}' failed", config.list_address))?;
+    let from_addr: Address = config.from_address.parse().with_context(|| {
+        format!(
+            "SMTP: parsing from_address '{}' failed",
+            config.from_address
+        )
+    })?;
+    let list_addr: Address = config.list_address.parse().with_context(|| {
+        format!(
+            "SMTP: parsing list_address '{}' failed",
+            config.list_address
+        )
+    })?;
 
     let envelope =
         Envelope::new(Some(from_addr), vec![list_addr]).context("SMTP: building envelope")?;
@@ -95,8 +124,12 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
         tls_mode = tls_mode,
         "SMTP: building transport"
     );
-    let transport = build_transport(config, creds)
-        .with_context(|| format!("SMTP: build_transport for {}:{} ({}) failed", config.host, config.port, tls_mode))?;
+    let transport = build_transport(config, creds).with_context(|| {
+        format!(
+            "SMTP: build_transport for {}:{} ({}) failed",
+            config.host, config.port, tls_mode
+        )
+    })?;
     debug!("SMTP: transport built — connecting and sending");
 
     let t = std::time::Instant::now();
@@ -149,27 +182,34 @@ fn build_raw_email(config: &SmtpConfig, reply: &SmtpReply) -> Result<String> {
         )
     };
 
-    let subject = if reply.subject.to_lowercase().starts_with("re:") {
-        reply.subject.clone()
-    } else {
+    let subject = if reply.is_thread_reply() && !reply.subject.to_lowercase().starts_with("re:") {
         format!("Re: {}", reply.subject)
+    } else {
+        reply.subject.clone()
     };
+    let subject = sanitize_header_value(&subject);
 
-    // Build deduplicated References chain: ancestors + direct parent (oldest → newest)
-    let irt = strip_angle_brackets(&reply.in_reply_to);
-    let mut ref_ids: Vec<String> = reply
-        .references
-        .iter()
-        .map(|r| strip_angle_brackets(r))
-        .collect();
-    if !ref_ids.contains(&irt) {
-        ref_ids.push(irt.clone());
-    }
-    let references_header = ref_ids
-        .iter()
-        .map(|r| format!("<{}>", r))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let reply_headers = if reply.is_thread_reply() {
+        // Build deduplicated References chain: ancestors + direct parent (oldest -> newest)
+        let irt = strip_angle_brackets(&reply.in_reply_to);
+        let mut ref_ids: Vec<String> = reply
+            .references
+            .iter()
+            .map(|r| strip_angle_brackets(r))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if !irt.is_empty() && !ref_ids.contains(&irt) {
+            ref_ids.push(irt.clone());
+        }
+        let references_header = ref_ids
+            .iter()
+            .map(|r| format!("<{}>", r))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some((irt, references_header))
+    } else {
+        None
+    };
 
     let date = chrono::Utc::now()
         .format("%a, %d %b %Y %H:%M:%S +0000")
@@ -185,17 +225,18 @@ fn build_raw_email(config: &SmtpConfig, reply: &SmtpReply) -> Result<String> {
         .join("\r\n");
 
     let mut headers = Vec::<String>::new();
-    headers.push(format!(
-        "From: {} <{}>",
-        from_display, config.from_address
-    ));
+    headers.push(format!("From: {} <{}>", from_display, config.from_address));
     headers.push(format!("To: {}", config.list_address));
     headers.push(format!("Reply-To: {}", config.list_address));
     headers.push(format!("Subject: {}", subject));
     headers.push(format!("Date: {}", date));
     headers.push(format!("Message-ID: <{}>", reply.our_message_id));
-    headers.push(format!("In-Reply-To: <{}>", irt));
-    headers.push(format!("References: {}", references_header));
+    if let Some((irt, references_header)) = reply_headers {
+        headers.push(format!("In-Reply-To: <{}>", irt));
+        if !references_header.is_empty() {
+            headers.push(format!("References: {}", references_header));
+        }
+    }
     headers.push("MIME-Version: 1.0".to_owned());
     headers.push("Content-Type: text/plain; charset=utf-8".to_owned());
     headers.push("Content-Transfer-Encoding: base64".to_owned());
@@ -225,9 +266,7 @@ fn build_transport(
     } else {
         debug!(host = %config.host, port = config.port, "SMTP: using STARTTLS");
         let t = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.host)
-            .with_context(|| {
-                format!("SMTP: building STARTTLS relay for {} failed", config.host)
-            })?
+            .with_context(|| format!("SMTP: building STARTTLS relay for {} failed", config.host))?
             .port(config.port)
             .credentials(creds)
             .build();

@@ -114,7 +114,11 @@ impl UserAllowList {
         matches!(self, Self::Deny)
     }
     pub fn explicit_count(&self) -> Option<usize> {
-        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+        if let Self::Explicit(set) = self {
+            Some(set.len())
+        } else {
+            None
+        }
     }
 }
 
@@ -139,7 +143,11 @@ impl RoomAllowList {
         matches!(self, Self::Deny)
     }
     pub fn explicit_count(&self) -> Option<usize> {
-        if let Self::Explicit(set) = self { Some(set.len()) } else { None }
+        if let Self::Explicit(set) = self {
+            Some(set.len())
+        } else {
+            None
+        }
     }
 }
 
@@ -176,6 +184,11 @@ pub struct SmtpConfig {
     /// false (default) = STARTTLS (port 587).
     #[serde(default)]
     pub require_smtps: bool,
+    /// If true, top-level Matrix messages in allowed rooms are sent to the
+    /// mailing list as new email threads. Replies in Matrix threads are always
+    /// handled when SMTP is configured.
+    #[serde(default)]
+    pub allow_new_threads_from_matrix: bool,
 }
 
 fn default_smtp_port() -> u16 {
@@ -200,9 +213,7 @@ impl Secrets {
     }
 }
 
-pub fn parse_admin_users(
-    security: &SecurityConfig,
-) -> HashSet<matrix_sdk::ruma::OwnedUserId> {
+pub fn parse_admin_users(security: &SecurityConfig) -> HashSet<matrix_sdk::ruma::OwnedUserId> {
     security
         .admin_users
         .iter()
@@ -246,9 +257,7 @@ pub fn parse_allowed_rooms(security: &SecurityConfig) -> Result<RoomAllowList> {
             for s in list {
                 let rid = s
                     .parse::<matrix_sdk::ruma::OwnedRoomId>()
-                    .with_context(|| {
-                        format!("Invalid Matrix room ID in allowed_rooms: {:?}", s)
-                    })?;
+                    .with_context(|| format!("Invalid Matrix room ID in allowed_rooms: {:?}", s))?;
                 set.insert(rid);
             }
             Ok(RoomAllowList::Explicit(set))
@@ -258,10 +267,13 @@ pub fn parse_allowed_rooms(security: &SecurityConfig) -> Result<RoomAllowList> {
 
 pub fn parse_allowed_repliers(
     security: &SecurityConfig,
-) -> HashSet<matrix_sdk::ruma::OwnedUserId> {
-    security
-        .allowed_repliers
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect()
+) -> Result<HashSet<matrix_sdk::ruma::OwnedUserId>> {
+    let mut set = HashSet::new();
+    for s in &security.allowed_repliers {
+        let uid = s
+            .parse::<matrix_sdk::ruma::OwnedUserId>()
+            .with_context(|| format!("Invalid Matrix user ID in allowed_repliers: {:?}", s))?;
+        set.insert(uid);
+    }
+    Ok(set)
 }

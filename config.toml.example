@@ -49,6 +49,7 @@ username = "bot@example.com"
 from_address = "bot@example.com"   # address in the From header of bridge replies
 list_address = "list@lists.example.com"  # mailing list posting address (To + Reply-To)
 # require_smtps = false  # set true if your server requires implicit TLS on port 465
+# allow_new_threads_from_matrix = false  # true: top-level Matrix messages create new list emails
 
 [limits]
 max_attachment_bytes = 10485760  # 10MB

@@ -2,9 +2,9 @@ use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
-    Client,
     config::SyncSettings,
-    ruma::{OwnedServerName, RoomOrAliasId, api::client::filter::FilterDefinition},
+    ruma::{api::client::filter::FilterDefinition, OwnedServerName, RoomOrAliasId},
+    Client,
 };
 use serde_json;
 use tokio::{fs, signal, sync::mpsc, time::sleep};
@@ -21,7 +21,10 @@ mod matrix_reply;
 mod smtp_send;
 mod verify;
 
-use config::{Config, Secrets, parse_admin_users, parse_allowed_inviters, parse_allowed_repliers, parse_allowed_rooms};
+use config::{
+    parse_admin_users, parse_allowed_inviters, parse_allowed_repliers, parse_allowed_rooms, Config,
+    Secrets,
+};
 use db::Db;
 use email::{ParsedEmail, RawEmail};
 use verify::BotState;
@@ -57,7 +60,10 @@ where
         info!(task = name, "Task started");
         fut.await;
         // Background tasks are expected to loop forever; reaching here is abnormal.
-        warn!(task = name, "Task exited — this task should run indefinitely");
+        warn!(
+            task = name,
+            "Task exited — this task should run indefinitely"
+        );
     })
 }
 
@@ -80,10 +86,7 @@ async fn main() -> Result<()> {
 
     install_panic_hook();
 
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "email-bot starting"
-    );
+    info!(version = env!("CARGO_PKG_VERSION"), "email-bot starting");
     info!(
         "Runtime debugging:\n  \
          RUST_LOG=debug                  — verbose output from all crates\n  \
@@ -111,9 +114,8 @@ async fn main() -> Result<()> {
     );
 
     // Init store directory and database
-    let store_path = PathBuf::from(
-        std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()),
-    );
+    let store_path =
+        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
     debug!(store_path = %store_path.display(), "Ensuring store directory exists");
     fs::create_dir_all(&store_path)
         .await
@@ -133,7 +135,8 @@ async fn main() -> Result<()> {
         .context("Invalid allowed_inviters in [security] config")?;
     let allowed_rooms = parse_allowed_rooms(&config.security)
         .context("Invalid allowed_rooms in [security] config")?;
-    let allowed_repliers = parse_allowed_repliers(&config.security);
+    let allowed_repliers = parse_allowed_repliers(&config.security)
+        .context("Invalid allowed_repliers in [security] config")?;
     let encryption_strategy = config.security.encryption_strategy;
     info!(strategy = ?encryption_strategy, "Encryption strategy configured");
 
@@ -212,11 +215,14 @@ async fn main() -> Result<()> {
                     smtp_username = %smtp_config.username,
                     from_address = %smtp_config.from_address,
                     list_address = %smtp_config.list_address,
+                    allow_new_threads_from_matrix = smtp_config.allow_new_threads_from_matrix,
                     allowed_replier_count = allowed_repliers.len(),
                     "Matrix→Email reply bridging: enabled"
                 );
                 if allowed_repliers.is_empty() {
-                    info!("All room members may send email replies (no allowed_repliers restriction)");
+                    info!(
+                        "All room members may send email replies (no allowed_repliers restriction)"
+                    );
                 }
                 matrix_reply::register_reply_handler(
                     &client,
@@ -226,6 +232,7 @@ async fn main() -> Result<()> {
                         smtp_config,
                         smtp_password: smtp_password.clone(),
                         db: db.clone(),
+                        allowed_rooms: allowed_rooms.clone(),
                     },
                 );
                 info!("Matrix→Email reply event handler registered");
@@ -263,7 +270,10 @@ async fn main() -> Result<()> {
         if invited.is_empty() {
             debug!("No pending invites after initial sync");
         } else {
-            info!(count = invited.len(), "Pending invite(s) found after initial sync — processing");
+            info!(
+                count = invited.len(),
+                "Pending invite(s) found after initial sync — processing"
+            );
             for room in invited {
                 let room_id = room.room_id().to_owned();
                 // Inviter info is unavailable when replaying from the store.
@@ -288,11 +298,17 @@ async fn main() -> Result<()> {
                     Ok(room_or_alias) => {
                         info!(room_id = %room_id, via = ?via, "Joining pending invite room");
                         match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => info!(room_id = %room_id, "Joined pending invite room successfully"),
-                            Err(e) => warn!(room_id = %room_id, error = %e, "Failed to join pending invite room"),
+                            Ok(_) => {
+                                info!(room_id = %room_id, "Joined pending invite room successfully")
+                            }
+                            Err(e) => {
+                                warn!(room_id = %room_id, error = %e, "Failed to join pending invite room")
+                            }
                         }
                     }
-                    Err(e) => warn!(room_id = %room_id, error = %e, "Invalid room ID in pending invite — skipping"),
+                    Err(e) => {
+                        warn!(room_id = %room_id, error = %e, "Invalid room ID in pending invite — skipping")
+                    }
                 }
             }
         }
@@ -345,6 +361,7 @@ async fn main() -> Result<()> {
     let client_sender = client.clone();
     let limits_sender = limits_config.clone();
     let mailing_list_sender = mailing_list_config.clone();
+    let allowed_rooms_sender = allowed_rooms.clone();
     let _send_handle = spawn_task("matrix_send", async move {
         matrix_send_loop(
             client_sender,
@@ -352,6 +369,7 @@ async fn main() -> Result<()> {
             db_sender,
             mailing_list_sender,
             limits_sender,
+            allowed_rooms_sender,
         )
         .await;
     });
@@ -364,22 +382,22 @@ async fn main() -> Result<()> {
     let db_retry = db.clone();
     let client_retry = client.clone();
     let limits_retry = limits_config.clone();
+    let allowed_rooms_retry = allowed_rooms.clone();
     let _retry_handle = spawn_task("email_retry", async move {
-        retry_loop(client_retry, db_retry, limits_retry).await;
+        retry_loop(client_retry, db_retry, limits_retry, allowed_rooms_retry).await;
     });
 
-    let _smtp_retry_handle = if let (Some(smtp_cfg), Some(smtp_pw)) =
-        (smtp_config_opt, secrets.smtp_password.clone())
-    {
-        info!("Spawning SMTP retry worker");
-        let db_smtp_retry = db.clone();
-        Some(spawn_task("smtp_retry", async move {
-            smtp_retry_loop(db_smtp_retry, smtp_cfg, smtp_pw).await;
-        }))
-    } else {
-        debug!("SMTP retry worker not started (no SMTP config or SMTP_PASSWORD)");
-        None
-    };
+    let _smtp_retry_handle =
+        if let (Some(smtp_cfg), Some(smtp_pw)) = (smtp_config_opt, secrets.smtp_password.clone()) {
+            info!("Spawning SMTP retry worker");
+            let db_smtp_retry = db.clone();
+            Some(spawn_task("smtp_retry", async move {
+                smtp_retry_loop(db_smtp_retry, smtp_cfg, smtp_pw).await;
+            }))
+        } else {
+            debug!("SMTP retry worker not started (no SMTP config or SMTP_PASSWORD)");
+            None
+        };
 
     tokio::spawn(async move {
         if signal::ctrl_c().await.is_ok() {
@@ -391,7 +409,10 @@ async fn main() -> Result<()> {
     info!("All background tasks spawned — entering Matrix continuous sync loop");
     let sync_filter = FilterDefinition::with_lazy_loading();
     loop {
-        match client.sync(SyncSettings::default().filter(sync_filter.clone().into())).await {
+        match client
+            .sync(SyncSettings::default().filter(sync_filter.clone().into()))
+            .await
+        {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
             Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
         }
@@ -422,7 +443,11 @@ fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::
     );
     match &config.smtp {
         Some(smtp) => {
-            let tls_mode = if smtp.require_smtps { "SMTPS" } else { "STARTTLS" };
+            let tls_mode = if smtp.require_smtps {
+                "SMTPS"
+            } else {
+                "STARTTLS"
+            };
             info!(
                 host = %smtp.host,
                 port = smtp.port,
@@ -430,6 +455,7 @@ fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::
                 username = %smtp.username,
                 from_address = %smtp.from_address,
                 list_address = %smtp.list_address,
+                allow_new_threads_from_matrix = smtp.allow_new_threads_from_matrix,
                 smtp_password_set = secrets.smtp_password.is_some(),
                 "SMTP"
             );
@@ -460,6 +486,7 @@ async fn matrix_send_loop(
     db: Db,
     mailing_list_config: config::MailingListConfig,
     limits: config::LimitsConfig,
+    allowed_rooms: config::RoomAllowList,
 ) {
     info!("Matrix send loop: ready, waiting for emails");
     while let Some(raw) = rx.recv().await {
@@ -535,7 +562,9 @@ async fn matrix_send_loop(
                 );
 
                 let t_post = std::time::Instant::now();
-                if let Err(e) = matrix_post::post_email(&client, &parsed, &db, &limits).await {
+                if let Err(e) =
+                    matrix_post::post_email(&client, &parsed, &db, &limits, &allowed_rooms).await
+                {
                     warn!(
                         uid = uid,
                         message_id = %parsed.message_id,
@@ -579,7 +608,12 @@ async fn matrix_send_loop(
     warn!("Matrix send loop: channel closed — IMAP sync task may have exited");
 }
 
-async fn retry_loop(client: Client, db: Db, limits: config::LimitsConfig) {
+async fn retry_loop(
+    client: Client,
+    db: Db,
+    limits: config::LimitsConfig,
+    allowed_rooms: config::RoomAllowList,
+) {
     info!("Email retry loop: started (poll interval: 300s)");
     loop {
         sleep(Duration::from_secs(300)).await;
@@ -629,7 +663,9 @@ async fn retry_loop(client: Client, db: Db, limits: config::LimitsConfig) {
                         "Email retry loop: retrying post"
                     );
                     let t = std::time::Instant::now();
-                    match matrix_post::post_email(&client, &parsed, &db, &limits).await {
+                    match matrix_post::post_email(&client, &parsed, &db, &limits, &allowed_rooms)
+                        .await
+                    {
                         Ok(()) => {
                             info!(
                                 retry_id = id,
@@ -641,8 +677,7 @@ async fn retry_loop(client: Client, db: Db, limits: config::LimitsConfig) {
                             db.ack_retry(id).await.ok();
                         }
                         Err(e) => {
-                            let backoff_secs =
-                                (60u64 * (1u64 << attempts.min(10))).min(3600);
+                            let backoff_secs = (60u64 * (1u64 << attempts.min(10))).min(3600);
                             let next_retry_at =
                                 chrono::Utc::now().timestamp() + backoff_secs as i64;
                             warn!(
@@ -665,7 +700,11 @@ async fn retry_loop(client: Client, db: Db, limits: config::LimitsConfig) {
 }
 
 async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password: String) {
-    let tls_mode = if smtp_config.require_smtps { "SMTPS" } else { "STARTTLS" };
+    let tls_mode = if smtp_config.require_smtps {
+        "SMTPS"
+    } else {
+        "STARTTLS"
+    };
     info!(
         smtp_host = %smtp_config.host,
         smtp_port = smtp_config.port,
@@ -699,7 +738,9 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
                         error = %e,
                         "SMTP retry loop: corrupt payload — parking with max retry_at to stop blocking queue"
                     );
-                    db.mark_route_failed(&item.matrix_event_id, i64::MAX).await.ok();
+                    db.mark_route_failed(&item.matrix_event_id, i64::MAX)
+                        .await
+                        .ok();
                     continue;
                 }
             };
@@ -726,8 +767,7 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
                     db.mark_route_sent(&item.matrix_event_id).await.ok();
                 }
                 Err(e) => {
-                    let backoff_secs =
-                        (60u64 * (1u64 << (item.attempts as u32).min(10))).min(3600);
+                    let backoff_secs = (60u64 * (1u64 << (item.attempts as u32).min(10))).min(3600);
                     let next_retry_at = chrono::Utc::now().timestamp() + backoff_secs as i64;
                     warn!(
                         matrix_event_id = %item.matrix_event_id,

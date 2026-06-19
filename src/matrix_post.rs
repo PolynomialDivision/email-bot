@@ -6,7 +6,7 @@ use matrix_sdk::ruma::{OwnedEventId, UInt};
 use matrix_sdk::{Client, RoomState};
 use tracing::{debug, info, warn};
 
-use crate::config::LimitsConfig;
+use crate::config::{LimitsConfig, RoomAllowList};
 use crate::db::Db;
 use crate::email::ParsedEmail;
 use crate::format::format_email;
@@ -16,6 +16,7 @@ pub async fn post_email(
     email: &ParsedEmail,
     db: &Db,
     limits: &LimitsConfig,
+    allowed_rooms: &RoomAllowList,
 ) -> Result<()> {
     debug!(
         uid = email.uid,
@@ -95,6 +96,7 @@ pub async fn post_email(
         .joined_rooms()
         .into_iter()
         .filter(|r| r.state() == RoomState::Joined)
+        .filter(|r| allowed_rooms.allows(r.room_id()))
         .collect();
 
     if rooms.is_empty() {
@@ -186,18 +188,24 @@ pub async fn post_email(
             count = email.attachments.len(),
             "matrix_post: posting attachments"
         );
-        post_attachments(client, email, limits).await;
+        post_attachments(client, email, limits, allowed_rooms).await;
     }
 
     Ok(())
 }
 
-async fn post_attachments(client: &Client, email: &ParsedEmail, limits: &LimitsConfig) {
+async fn post_attachments(
+    client: &Client,
+    email: &ParsedEmail,
+    limits: &LimitsConfig,
+    allowed_rooms: &RoomAllowList,
+) {
     let max_bytes = limits.effective_max_attachment_bytes();
     let rooms: Vec<_> = client
         .joined_rooms()
         .into_iter()
         .filter(|r| r.state() == RoomState::Joined)
+        .filter(|r| allowed_rooms.allows(r.room_id()))
         .collect();
 
     for (idx, attachment) in email.attachments.iter().enumerate() {

@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 
 use matrix_sdk::{
-    Room, RoomState,
     ruma::{
-        OwnedUserId,
         events::room::message::{MessageType, OriginalSyncRoomMessageEvent, Relation},
+        OwnedUserId,
     },
+    Room, RoomState,
 };
 use tracing::{debug, info, warn};
 
-use crate::config::SmtpConfig;
+use crate::config::{RoomAllowList, SmtpConfig};
 use crate::db::Db;
-use crate::smtp_send::{SmtpReply, send_reply};
+use crate::smtp_send::{send_reply, SmtpReply};
 
 use serde_json;
 
@@ -23,6 +23,7 @@ pub struct ReplyState {
     pub smtp_config: SmtpConfig,
     pub smtp_password: String,
     pub db: Db,
+    pub allowed_rooms: RoomAllowList,
 }
 
 pub fn register_reply_handler(client: &matrix_sdk::Client, state: ReplyState) {
@@ -39,29 +40,25 @@ pub fn register_reply_handler(client: &matrix_sdk::Client, state: ReplyState) {
     info!("Matrix reply→email event handler registered");
 }
 
-async fn handle_possible_reply(
-    state: ReplyState,
-    room: Room,
-    ev: OriginalSyncRoomMessageEvent,
-) {
-    let event_id = ev.event_id.as_str();
-    let sender = ev.sender.as_str();
+async fn handle_possible_reply(state: ReplyState, room: Room, ev: OriginalSyncRoomMessageEvent) {
+    let event_id = ev.event_id.to_string();
+    let sender = ev.sender.to_string();
 
     debug!(
-        event_id = event_id,
-        sender = sender,
+        event_id = %event_id,
+        sender = %sender,
         room_id = %room.room_id(),
         "Matrix reply handler: event received"
     );
 
     if ev.sender == state.bot_user_id {
-        debug!(event_id = event_id, "Skip: own message");
+        debug!(event_id = %event_id, "Skip: own message");
         return;
     }
 
     if room.state() != RoomState::Joined {
         debug!(
-            event_id = event_id,
+            event_id = %event_id,
             room_id = %room.room_id(),
             room_state = ?room.state(),
             "Skip: room not in Joined state"
@@ -69,30 +66,36 @@ async fn handle_possible_reply(
         return;
     }
 
-    let MessageType::Text(ref text) = ev.content.msgtype else {
-        debug!(event_id = event_id, sender = sender, "Skip: not a text message");
+    if !state.allowed_rooms.allows(room.room_id()) {
+        warn!(
+            event_id = %event_id,
+            room_id = %room.room_id(),
+            sender = sender,
+            "Skip: room not in allowed_rooms"
+        );
         return;
-    };
+    }
 
-    let Some(Relation::Thread(ref thread)) = ev.content.relates_to else {
-        debug!(event_id = event_id, sender = sender, "Skip: not a thread reply (no m.thread relation)");
+    let MessageType::Text(ref text) = ev.content.msgtype else {
+        debug!(event_id = %event_id, sender = %sender, "Skip: not a text message");
         return;
     };
+    let raw_body = text.body.clone();
 
     if !state.allowed_repliers.is_empty() && !state.allowed_repliers.contains(&ev.sender) {
         warn!(
-            event_id = event_id,
-            sender = sender,
+            event_id = %event_id,
+            sender = %sender,
             "Skip: sender not in allowed_repliers — unauthorized bridge attempt"
         );
         return;
     }
 
     // Idempotency guard: skip if this Matrix event was already bridged.
-    match state.db.get_route_by_matrix_event(event_id).await {
+    match state.db.get_route_by_matrix_event(&event_id).await {
         Ok(Some(existing)) => {
             info!(
-                event_id = event_id,
+                event_id = %event_id,
                 smtp_status = ?existing.origin,
                 "Skip: event already bridged (dedup)"
             );
@@ -100,32 +103,73 @@ async fn handle_possible_reply(
         }
         Err(e) => {
             warn!(
-                event_id = event_id,
+                event_id = %event_id,
                 error = %e,
                 "DB error on dedup check — skipping to avoid double-send"
             );
             return;
         }
         Ok(None) => {
-            debug!(event_id = event_id, "Dedup check passed: not yet bridged");
+            debug!(event_id = %event_id, "Dedup check passed: not yet bridged");
         }
     }
 
-    // The thread root must come from an email (not a Matrix-originated message).
+    let relates_to = ev.content.relates_to.clone();
+    match relates_to {
+        Some(Relation::Thread(thread)) => {
+            handle_thread_reply(state, room, ev, raw_body, thread).await;
+        }
+        Some(_) => {
+            debug!(
+                event_id = %event_id,
+                sender = %sender,
+                "Skip: related message is not a thread reply"
+            );
+        }
+        None if state.smtp_config.allow_new_threads_from_matrix => {
+            handle_new_thread_message(state, room, ev, raw_body).await;
+        }
+        None => {
+            debug!(
+                event_id = %event_id,
+                sender = %sender,
+                "Skip: top-level Matrix→Email posting disabled"
+            );
+        }
+    }
+}
+
+async fn handle_thread_reply(
+    state: ReplyState,
+    room: Room,
+    ev: OriginalSyncRoomMessageEvent,
+    raw_body: String,
+    thread: matrix_sdk::ruma::events::relation::Thread,
+) {
+    let event_id = ev.event_id.as_str();
+    let sender = ev.sender.as_str();
+
+    // The thread root must be known to the bridge. It may be email-originated
+    // or a Matrix-originated top-level post that created a mailing-list thread.
     let thread_root_event_id = thread.event_id.to_string();
     debug!(
         event_id = event_id,
         thread_root_event_id = %thread_root_event_id,
         "Looking up thread root in DB"
     );
-    let root_route = match state.db.get_route_by_matrix_event(&thread_root_event_id).await {
-        Ok(Some(r)) if r.origin == "email" => {
+    let root_route = match state
+        .db
+        .get_route_by_matrix_event(&thread_root_event_id)
+        .await
+    {
+        Ok(Some(r)) if r.origin == "email" || r.origin == "matrix" => {
             info!(
                 event_id = event_id,
                 thread_root_event_id = %thread_root_event_id,
                 email_message_id = %r.email_message_id,
                 subject = ?r.subject,
-                "Thread root found (origin=email) — proceeding"
+                origin = %r.origin,
+                "Thread root found — proceeding"
             );
             r
         }
@@ -134,7 +178,7 @@ async fn handle_possible_reply(
                 event_id = event_id,
                 thread_root_event_id = %thread_root_event_id,
                 origin = %r.origin,
-                "Skip: thread root is Matrix-originated (not an email thread)"
+                "Skip: thread root has unsupported origin"
             );
             return;
         }
@@ -158,7 +202,7 @@ async fn handle_possible_reply(
     };
 
     let (in_reply_to_email_id, specific_route) =
-        resolve_in_reply_to(thread, &root_route, &state.db).await;
+        resolve_in_reply_to(&thread, &root_route, &state.db).await;
     debug!(
         event_id = event_id,
         in_reply_to_email_id = %in_reply_to_email_id,
@@ -187,7 +231,7 @@ async fn handle_possible_reply(
         "Resolved sender display name"
     );
 
-    let body = sanitize_reply_body(&text.body);
+    let body = sanitize_reply_body(&raw_body);
     let body_len = body.len();
     if body.is_empty() {
         info!(
@@ -197,7 +241,11 @@ async fn handle_possible_reply(
         );
         return;
     }
-    debug!(event_id = event_id, body_len = body_len, "Reply body sanitized");
+    debug!(
+        event_id = event_id,
+        body_len = body_len,
+        "Reply body sanitized"
+    );
 
     let smtp_reply = SmtpReply::new(
         display_name.clone(),
@@ -208,7 +256,94 @@ async fn handle_possible_reply(
         body,
     );
 
-    let smtp_payload = match serde_json::to_string(&smtp_reply) {
+    send_matrix_email(
+        &state,
+        event_id,
+        sender,
+        &display_name,
+        &smtp_reply,
+        root_route.thread_root_email_message_id.as_deref(),
+        Some(&subject),
+        body_len,
+        "Bridging Matrix reply → email",
+    )
+    .await;
+}
+
+async fn handle_new_thread_message(
+    state: ReplyState,
+    room: Room,
+    ev: OriginalSyncRoomMessageEvent,
+    raw_body: String,
+) {
+    let event_id = ev.event_id.as_str();
+    let sender = ev.sender.as_str();
+
+    let display_name = get_display_name(&room, &ev.sender).await;
+    let body = sanitize_reply_body(&raw_body);
+    let body_len = body.len();
+    if body.is_empty() {
+        info!(
+            event_id = event_id,
+            sender = sender,
+            "Skip: body is empty after stripping quoted lines"
+        );
+        return;
+    }
+
+    let subject = derive_new_thread_subject(&display_name, &body);
+    let smtp_reply = SmtpReply::new_thread(
+        display_name.clone(),
+        ev.sender.to_string(),
+        subject.clone(),
+        body,
+    );
+
+    if let Err(e) = state
+        .db
+        .store_thread(
+            &smtp_reply.our_message_id,
+            event_id,
+            &smtp_reply.our_message_id,
+            "matrix",
+        )
+        .await
+    {
+        warn!(
+            event_id = event_id,
+            our_message_id = %smtp_reply.our_message_id,
+            error = %e,
+            "Failed to store Matrix-originated thread mapping — aborting"
+        );
+        return;
+    }
+
+    send_matrix_email(
+        &state,
+        event_id,
+        sender,
+        &display_name,
+        &smtp_reply,
+        Some(&smtp_reply.our_message_id),
+        Some(&subject),
+        body_len,
+        "Bridging top-level Matrix message → new email thread",
+    )
+    .await;
+}
+
+async fn send_matrix_email(
+    state: &ReplyState,
+    event_id: &str,
+    sender: &str,
+    display_name: &str,
+    smtp_reply: &SmtpReply,
+    thread_root_email_message_id: Option<&str>,
+    subject: Option<&str>,
+    body_len: usize,
+    action: &'static str,
+) {
+    let smtp_payload = match serde_json::to_string(smtp_reply) {
         Ok(p) => p,
         Err(e) => {
             warn!(event_id = event_id, error = %e, "Failed to serialize SMTP payload");
@@ -227,8 +362,8 @@ async fn handle_possible_reply(
         .store_matrix_reply_pending(
             event_id,
             &smtp_reply.our_message_id,
-            root_route.thread_root_email_message_id.as_deref(),
-            root_route.subject.as_deref(),
+            thread_root_email_message_id,
+            subject,
             &smtp_payload,
         )
         .await
@@ -243,10 +378,10 @@ async fn handle_possible_reply(
         sender = sender,
         display_name = %display_name,
         our_message_id = %smtp_reply.our_message_id,
-        in_reply_to = %in_reply_to_email_id,
-        subject = %subject,
+        in_reply_to = %smtp_reply.in_reply_to,
+        subject = ?subject,
         body_len = body_len,
-        "Bridging Matrix reply → email"
+        action
     );
 
     // Step 2: attempt SMTP delivery.
@@ -276,17 +411,32 @@ async fn handle_possible_reply(
                 next_retry_in_secs = 60,
                 "SMTP delivery failed — marking route FAILED, retry in 60s"
             );
-            if let Err(db_err) = state
-                .db
-                .mark_route_failed(event_id, next_retry_at)
-                .await
-            {
+            if let Err(db_err) = state.db.mark_route_failed(event_id, next_retry_at).await {
                 warn!(event_id = event_id, error = %db_err, "Failed to mark route FAILED");
             } else {
-                debug!(event_id = event_id, "Route state: FAILED (scheduled for retry)");
+                debug!(
+                    event_id = event_id,
+                    "Route state: FAILED (scheduled for retry)"
+                );
             }
         }
     }
+}
+
+fn derive_new_thread_subject(display_name: &str, body: &str) -> String {
+    let first_line = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Matrix message");
+    let mut subject: String = first_line.chars().take(72).collect();
+    if first_line.chars().count() > 72 {
+        subject.push_str("...");
+    }
+    if subject.is_empty() {
+        subject = "Matrix message".to_owned();
+    }
+    format!("{} via Matrix: {}", display_name, subject)
 }
 
 /// Resolve which email Message-Id to use as In-Reply-To.
@@ -304,7 +454,7 @@ async fn resolve_in_reply_to(
         // Don't double-look-up if m.in_reply_to points at the thread root itself.
         if irt_event_id != thread.event_id.to_string() {
             match db.get_route_by_matrix_event(&irt_event_id).await {
-                Ok(Some(r)) if r.origin == "email" => {
+                Ok(Some(r)) if r.origin == "email" || r.origin == "matrix" => {
                     let email_id = r.email_message_id.clone();
                     return (email_id, Some(r));
                 }
@@ -370,10 +520,7 @@ fn sanitize_reply_body(raw: &str) -> String {
         })
         .collect();
 
-    let start = lines
-        .iter()
-        .position(|l| !l.trim().is_empty())
-        .unwrap_or(0);
+    let start = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
     let end = lines
         .iter()
         .rposition(|l| !l.trim().is_empty())
