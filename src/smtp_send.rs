@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
-use base64::Engine;
-use lettre::address::{Address, Envelope};
+use lettre::address::Address;
+use lettre::message::{
+    header::{ContentType, HeaderName, HeaderValue},
+    Mailbox,
+};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -18,6 +21,9 @@ pub struct SmtpReply {
     /// serde(default) keeps old retry payloads in the DB deserializable.
     #[serde(default)]
     pub sender_matrix_id: String,
+    /// Stable secondary correlation key for mailing-list echoes.
+    #[serde(default)]
+    pub matrix_event_id: String,
     /// Email Message-Id being directly replied to (stripped of angle brackets).
     #[serde(default)]
     pub in_reply_to: String,
@@ -34,6 +40,7 @@ impl SmtpReply {
     pub fn new(
         display_name: String,
         sender_matrix_id: String,
+        matrix_event_id: String,
         in_reply_to: String,
         references: Vec<String>,
         subject: String,
@@ -43,6 +50,7 @@ impl SmtpReply {
         Self {
             display_name,
             sender_matrix_id,
+            matrix_event_id,
             in_reply_to,
             references,
             subject,
@@ -54,6 +62,7 @@ impl SmtpReply {
     pub fn new_thread(
         display_name: String,
         sender_matrix_id: String,
+        matrix_event_id: String,
         subject: String,
         body: String,
     ) -> Self {
@@ -61,6 +70,7 @@ impl SmtpReply {
         Self {
             display_name,
             sender_matrix_id,
+            matrix_event_id,
             in_reply_to: String::new(),
             references: Vec::new(),
             subject,
@@ -96,26 +106,9 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
         "SMTP: sending Matrix-originated email"
     );
 
-    debug!("SMTP: building raw RFC 2822 message");
-    let raw = build_raw_email(config, reply)?;
-    debug!(raw_bytes = raw.len(), "SMTP: raw message built");
-
-    let from_addr: Address = config.from_address.parse().with_context(|| {
-        format!(
-            "SMTP: parsing from_address '{}' failed",
-            config.from_address
-        )
-    })?;
-    let list_addr: Address = config.list_address.parse().with_context(|| {
-        format!(
-            "SMTP: parsing list_address '{}' failed",
-            config.list_address
-        )
-    })?;
-
-    let envelope =
-        Envelope::new(Some(from_addr), vec![list_addr]).context("SMTP: building envelope")?;
-    debug!("SMTP: envelope built");
+    debug!("SMTP: building RFC 5322 message");
+    let message = build_email(config, reply)?;
+    debug!(raw_bytes = message.formatted().len(), "SMTP: message built");
 
     let creds = Credentials::new(config.username.clone(), password.to_owned());
     debug!(
@@ -133,15 +126,12 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
     debug!("SMTP: transport built — connecting and sending");
 
     let t = std::time::Instant::now();
-    transport
-        .send_raw(&envelope, raw.as_bytes())
-        .await
-        .with_context(|| {
-            format!(
-                "SMTP send_raw failed for <{}> via {}:{} ({}) — check credentials and server reachability",
-                reply.our_message_id, config.host, config.port, tls_mode
-            )
-        })?;
+    let response = transport.send(message).await.with_context(|| {
+        format!(
+            "SMTP send failed for <{}> via {}:{} ({}) — check credentials and server reachability",
+            reply.our_message_id, config.host, config.port, tls_mode
+        )
+    })?;
 
     info!(
         smtp_host = %config.host,
@@ -149,13 +139,15 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
         tls_mode = tls_mode,
         message_id = %reply.our_message_id,
         to = %config.list_address,
+        smtp_response_code = %response.code(),
+        smtp_response = ?response.message().collect::<Vec<_>>(),
         elapsed_ms = t.elapsed().as_millis(),
-        "SMTP: reply sent successfully"
+        "SMTP: relay accepted message"
     );
     Ok(())
 }
 
-fn build_raw_email(config: &SmtpConfig, reply: &SmtpReply) -> Result<String> {
+fn build_email(config: &SmtpConfig, reply: &SmtpReply) -> Result<Message> {
     // From display name: "Alice (Matrix: @alice:example.org)"
     // DMARC is unaffected — the domain inside <addr> stays as our own sending domain.
     // Mailing lists that munge From for DMARC compliance only care about the <addr> domain.
@@ -211,44 +203,53 @@ fn build_raw_email(config: &SmtpConfig, reply: &SmtpReply) -> Result<String> {
         None
     };
 
-    let date = chrono::Utc::now()
-        .format("%a, %d %b %Y %H:%M:%S +0000")
-        .to_string();
+    let from_addr: Address = config.from_address.parse().with_context(|| {
+        format!(
+            "SMTP: parsing from_address '{}' failed",
+            config.from_address
+        )
+    })?;
+    let list_addr: Address = config.list_address.parse().with_context(|| {
+        format!(
+            "SMTP: parsing list_address '{}' failed",
+            config.list_address
+        )
+    })?;
 
-    // Base64-encode body for maximum transport safety, wrap at 76 chars.
-    let b64 = base64::engine::general_purpose::STANDARD.encode(body_with_attribution.as_bytes());
-    let body_lines = b64
-        .as_bytes()
-        .chunks(76)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\r\n");
+    let mut builder = Message::builder()
+        .from(Mailbox::new(Some(from_display), from_addr))
+        .to(Mailbox::new(None, list_addr.clone()))
+        .reply_to(Mailbox::new(None, list_addr))
+        .subject(subject)
+        .message_id(Some(format!("<{}>", reply.our_message_id)))
+        .header(ContentType::TEXT_PLAIN)
+        .raw_header(HeaderValue::new(
+            HeaderName::new_from_ascii_str("X-Bridge-Origin"),
+            "matrix".to_owned(),
+        ));
 
-    let mut headers = Vec::<String>::new();
-    headers.push(format!("From: {} <{}>", from_display, config.from_address));
-    headers.push(format!("To: {}", config.list_address));
-    headers.push(format!("Reply-To: {}", config.list_address));
-    headers.push(format!("Subject: {}", subject));
-    headers.push(format!("Date: {}", date));
-    headers.push(format!("Message-ID: <{}>", reply.our_message_id));
+    if !reply.matrix_event_id.is_empty() {
+        let matrix_event_id: String = reply
+            .matrix_event_id
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        builder = builder.raw_header(HeaderValue::new(
+            HeaderName::new_from_ascii_str("X-Matrix-Event-ID"),
+            matrix_event_id,
+        ));
+    }
+
     if let Some((irt, references_header)) = reply_headers {
-        headers.push(format!("In-Reply-To: <{}>", irt));
+        builder = builder.in_reply_to(format!("<{}>", irt));
         if !references_header.is_empty() {
-            headers.push(format!("References: {}", references_header));
+            builder = builder.references(references_header);
         }
     }
-    headers.push("MIME-Version: 1.0".to_owned());
-    headers.push("Content-Type: text/plain; charset=utf-8".to_owned());
-    headers.push("Content-Transfer-Encoding: base64".to_owned());
-    // Layer-2 loop guard — may be stripped by some mailing lists, but still useful.
-    headers.push("X-Bridge-Origin: matrix".to_owned());
 
-    let mut raw = headers.join("\r\n");
-    raw.push_str("\r\n\r\n");
-    raw.push_str(&body_lines);
-    raw.push_str("\r\n");
-
-    Ok(raw)
+    builder
+        .body(body_with_attribution)
+        .context("SMTP: building RFC 5322 message")
 }
 
 fn build_transport(
@@ -290,4 +291,69 @@ fn sanitize_header_value(s: &str) -> String {
         .chars()
         .take(64)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use mail_parser::MessageParser;
+
+    use super::{build_email, SmtpReply};
+    use crate::config::SmtpConfig;
+
+    fn config() -> SmtpConfig {
+        SmtpConfig {
+            host: "smtp.example.org".to_owned(),
+            port: 465,
+            username: "bridge@example.org".to_owned(),
+            from_address: "bridge@example.org".to_owned(),
+            list_address: "list@example.net".to_owned(),
+            require_smtps: true,
+            allow_new_threads_from_matrix: true,
+            list_confirmation_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn unicode_matrix_subject_is_rfc_encoded() {
+        let reply = SmtpReply::new_thread(
+            "unaxcornx".to_owned(),
+            "@sender:matrix.org".to_owned(),
+            "$event:matrix.org".to_owned(),
+            "unaxcornx via Matrix: Guest from 6–9 August".to_owned(),
+            "Guest from 6–9 August".to_owned(),
+        );
+
+        let raw = build_email(&config(), &reply).unwrap().formatted();
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("message has a header/body separator");
+        assert!(raw[..header_end].is_ascii());
+
+        let parsed = MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(
+            parsed.subject(),
+            Some("unaxcornx via Matrix: Guest from 6–9 August")
+        );
+    }
+
+    #[test]
+    fn thread_headers_and_loop_guard_are_preserved() {
+        let reply = SmtpReply::new(
+            "Alice".to_owned(),
+            "@alice:matrix.org".to_owned(),
+            "$event:matrix.org".to_owned(),
+            "parent@example.org".to_owned(),
+            vec!["root@example.org".to_owned()],
+            "Existing thread".to_owned(),
+            "Reply body".to_owned(),
+        );
+
+        let raw = build_email(&config(), &reply).unwrap().formatted();
+        let raw = String::from_utf8(raw).unwrap();
+        assert!(raw.contains("In-Reply-To: <parent@example.org>\r\n"));
+        assert!(raw.contains("References: <root@example.org> <parent@example.org>\r\n"));
+        assert!(raw.contains("X-Bridge-Origin: matrix\r\n"));
+        assert!(raw.contains("X-Matrix-Event-ID: $event:matrix.org\r\n"));
+    }
 }

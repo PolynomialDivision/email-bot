@@ -200,4 +200,3 @@ pub fn register_handlers(client: &Client, state: BotState) {
         }
     });
 }
-

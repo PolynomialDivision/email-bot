@@ -61,6 +61,9 @@ pub struct ParsedEmail {
     /// Set to "matrix" for emails sent by this bridge — used for loop prevention.
     #[serde(default)]
     pub bridge_origin: Option<String>,
+    /// Stable correlation identifier added to Matrix-originated emails.
+    #[serde(default)]
+    pub matrix_event_id: Option<String>,
 }
 
 fn clean_message_id(id: &str) -> String {
@@ -161,6 +164,16 @@ fn extract_bridge_origin(msg: &mail_parser::Message) -> Option<String> {
     None
 }
 
+fn extract_matrix_event_id(msg: &mail_parser::Message) -> Option<String> {
+    if let Some(mail_parser::HeaderValue::Text(t)) = msg.header("X-Matrix-Event-ID") {
+        let value = t.as_ref().trim();
+        if !value.is_empty() && !value.chars().any(char::is_control) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
 fn extract_list_id(msg: &mail_parser::Message) -> Option<String> {
     use mail_parser::{Address, HeaderName, HeaderValue};
 
@@ -224,6 +237,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
 
     let list_id = extract_list_id(&msg);
     let bridge_origin = extract_bridge_origin(&msg);
+    let matrix_event_id = extract_matrix_event_id(&msg);
 
     debug!(
         uid = raw.uid,
@@ -234,6 +248,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
         references_count = references.len(),
         has_list_id = list_id.is_some(),
         bridge_origin = ?bridge_origin,
+        matrix_event_id = ?matrix_event_id,
         "MIME: headers parsed"
     );
 
@@ -332,6 +347,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
         attachments,
         thread_root: None,
         bridge_origin,
+        matrix_event_id,
     })
 }
 
@@ -491,6 +507,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_delivery_correlation_headers() {
+        let raw = RawEmail {
+            uid: 3,
+            mailbox: "INBOX".to_owned(),
+            raw: b"From: list@example.org\r\nSubject: Echo\r\nMessage-ID: <echo@example.org>\r\nX-Bridge-Origin: matrix\r\nX-Matrix-Event-ID: $event:matrix.org\r\n\r\nBody"
+                .to_vec(),
+        };
+
+        let parsed = parse(&raw, &LimitsConfig::default()).unwrap();
+        assert_eq!(parsed.bridge_origin.as_deref(), Some("matrix"));
+        assert_eq!(parsed.matrix_event_id.as_deref(), Some("$event:matrix.org"));
+    }
+
+    #[test]
     fn test_parse_missing_headers() {
         let raw_bytes = b"From: nobody@example.com\r\n\r\nContent here";
         let raw = RawEmail {
@@ -522,6 +552,7 @@ mod tests {
             attachments: vec![],
             thread_root: None,
             bridge_origin: None,
+            matrix_event_id: None,
         };
 
         let config = MailingListConfig {
@@ -552,6 +583,7 @@ mod tests {
             attachments: vec![],
             thread_root: None,
             bridge_origin: None,
+            matrix_event_id: None,
         };
 
         let config = MailingListConfig {
@@ -582,6 +614,7 @@ mod tests {
             attachments: vec![],
             thread_root: None,
             bridge_origin: None,
+            matrix_event_id: None,
         };
 
         let config = MailingListConfig {
@@ -612,6 +645,7 @@ mod tests {
             attachments: vec![],
             thread_root: None,
             bridge_origin: None,
+            matrix_event_id: None,
         };
 
         let config = MailingListConfig {

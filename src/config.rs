@@ -189,6 +189,9 @@ pub struct SmtpConfig {
     /// handled when SMTP is configured.
     #[serde(default)]
     pub allow_new_threads_from_matrix: bool,
+    /// If set, notify the Matrix room when no mailing-list copy has returned
+    /// within this many seconds. Missing confirmation never triggers a resend.
+    pub list_confirmation_timeout_secs: Option<u64>,
 }
 
 fn default_smtp_port() -> u16 {

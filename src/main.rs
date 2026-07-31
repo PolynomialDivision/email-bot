@@ -3,7 +3,10 @@ use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::
 use anyhow::{Context, Result};
 use matrix_sdk::{
     config::SyncSettings,
-    ruma::{api::client::filter::FilterDefinition, OwnedServerName, RoomOrAliasId},
+    ruma::{
+        api::client::filter::FilterDefinition, events::room::message::RoomMessageEventContent,
+        OwnedRoomId, OwnedServerName, OwnedTransactionId, RoomOrAliasId,
+    },
     Client,
 };
 use serde_json;
@@ -199,6 +202,10 @@ async fn main() -> Result<()> {
 
     // Clone smtp config so both the reply handler and the retry worker can own a copy.
     let smtp_config_opt = config.smtp.clone();
+    let list_confirmation_timeout_secs = smtp_config_opt
+        .as_ref()
+        .and_then(|smtp| smtp.list_confirmation_timeout_secs)
+        .map(|seconds| seconds.max(300));
 
     if let Some(smtp_config) = config.smtp {
         match secrets.smtp_password {
@@ -216,6 +223,7 @@ async fn main() -> Result<()> {
                     from_address = %smtp_config.from_address,
                     list_address = %smtp_config.list_address,
                     allow_new_threads_from_matrix = smtp_config.allow_new_threads_from_matrix,
+                    list_confirmation_timeout_secs = ?list_confirmation_timeout_secs,
                     allowed_replier_count = allowed_repliers.len(),
                     "Matrix→Email reply bridging: enabled"
                 );
@@ -399,6 +407,22 @@ async fn main() -> Result<()> {
             None
         };
 
+    let _delivery_confirmation_handle = if let Some(timeout_secs) = list_confirmation_timeout_secs {
+        info!(
+            timeout_secs = timeout_secs,
+            automatic_retry = false,
+            "Spawning mailing-list confirmation monitor"
+        );
+        let db_confirmation = db.clone();
+        let client_confirmation = client.clone();
+        Some(spawn_task("delivery_confirmation", async move {
+            delivery_confirmation_loop(client_confirmation, db_confirmation, timeout_secs).await;
+        }))
+    } else {
+        info!("Mailing-list confirmation notices disabled");
+        None
+    };
+
     tokio::spawn(async move {
         if signal::ctrl_c().await.is_ok() {
             info!("Received SIGINT — shutting down");
@@ -508,6 +532,42 @@ async fn matrix_send_loop(
                     "Email parsed"
                 );
 
+                let is_list_email = email::is_mailing_list_email(&parsed, &mailing_list_config);
+                if is_list_email {
+                    match db
+                        .confirm_list_delivery(
+                            &parsed.message_id,
+                            parsed.matrix_event_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(Some(confirmation)) => info!(
+                            uid = uid,
+                            message_id = %parsed.message_id,
+                            matrix_event_id = %confirmation.matrix_event_id,
+                            previous_status = %confirmation.previous_status,
+                            matched_by = if parsed.matrix_event_id.as_deref() == Some(confirmation.matrix_event_id.as_str()) {
+                                "matrix_event_id"
+                            } else {
+                                "message_id"
+                            },
+                            "Mailing-list delivery confirmed"
+                        ),
+                        Ok(None) => debug!(
+                            uid = uid,
+                            message_id = %parsed.message_id,
+                            matrix_event_id = ?parsed.matrix_event_id,
+                            "Mailing-list message did not match an awaiting delivery"
+                        ),
+                        Err(e) => warn!(
+                            uid = uid,
+                            message_id = %parsed.message_id,
+                            error = %e,
+                            "Failed to check mailing-list delivery correlation"
+                        ),
+                    }
+                }
+
                 // Layer 1 loop guard: X-Bridge-Origin header set by this bridge on send.
                 if parsed.bridge_origin.as_deref() == Some("matrix") {
                     info!(
@@ -541,7 +601,7 @@ async fn matrix_send_loop(
                     }
                 }
 
-                if !email::is_mailing_list_email(&parsed, &mailing_list_config) {
+                if !is_list_email {
                     info!(
                         uid = uid,
                         message_id = %parsed.message_id,
@@ -762,9 +822,11 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
                         our_message_id = %reply.our_message_id,
                         attempt = item.attempts + 1,
                         elapsed_ms = t.elapsed().as_millis(),
-                        "SMTP retry loop: delivery succeeded — marking SENT"
+                        "SMTP retry loop: relay accepted message"
                     );
-                    db.mark_route_sent(&item.matrix_event_id).await.ok();
+                    db.mark_route_smtp_accepted(&item.matrix_event_id)
+                        .await
+                        .ok();
                 }
                 Err(e) => {
                     let backoff_secs = (60u64 * (1u64 << (item.attempts as u32).min(10))).min(3600);
@@ -809,6 +871,123 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
             }
         };
         sleep(sleep_dur).await;
+    }
+}
+
+async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
+    const NOTICE_LEASE_SECS: i64 = 300;
+    loop {
+        match db
+            .claim_unconfirmed_delivery(timeout_secs as i64, NOTICE_LEASE_SECS)
+            .await
+        {
+            Ok(Some(notice)) => {
+                info!(
+                    matrix_event_id = %notice.matrix_event_id,
+                    room_id = %notice.room_id,
+                    timeout_secs = timeout_secs,
+                    "Mailing-list delivery remains unconfirmed — notice claimed"
+                );
+
+                match db.delivery_notice_is_active(&notice.matrix_event_id).await {
+                    Ok(false) => {
+                        info!(
+                            matrix_event_id = %notice.matrix_event_id,
+                            "Delivery was confirmed after notice scheduling — suppressing notice"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            matrix_event_id = %notice.matrix_event_id,
+                            error = %e,
+                            "Could not re-check delivery state — releasing notice claim"
+                        );
+                        db.release_delivery_notice(&notice.matrix_event_id)
+                            .await
+                            .ok();
+                        sleep(Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+
+                let room_id = match notice.room_id.parse::<OwnedRoomId>() {
+                    Ok(room_id) => room_id,
+                    Err(e) => {
+                        error!(
+                            matrix_event_id = %notice.matrix_event_id,
+                            room_id = %notice.room_id,
+                            error = %e,
+                            "Invalid room ID for delivery notice — parking notice"
+                        );
+                        db.mark_delivery_notice_sent(&notice.matrix_event_id)
+                            .await
+                            .ok();
+                        continue;
+                    }
+                };
+                let Some(room) = client.get_room(&room_id) else {
+                    warn!(
+                        matrix_event_id = %notice.matrix_event_id,
+                        room_id = %room_id,
+                        "Room unavailable for delivery notice — releasing claim"
+                    );
+                    db.release_delivery_notice(&notice.matrix_event_id)
+                        .await
+                        .ok();
+                    sleep(Duration::from_secs(60)).await;
+                    continue;
+                };
+
+                let minutes = timeout_secs.div_ceil(60);
+                let content = RoomMessageEventContent::text_plain(format!(
+                    "Email delivery unconfirmed for Matrix event {}. The SMTP relay accepted the message, but no mailing-list copy was received within {} minutes. No automatic resend was attempted.",
+                    notice.matrix_event_id, minutes
+                ));
+                let transaction_id = OwnedTransactionId::from(format!(
+                    "email-delivery-unconfirmed:{}",
+                    notice.matrix_event_id
+                ));
+                match room
+                    .send(content)
+                    .with_transaction_id(transaction_id)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            matrix_event_id = %notice.matrix_event_id,
+                            room_id = %room_id,
+                            "Final delivery-unconfirmed notice posted; no resend scheduled"
+                        );
+                        if let Err(e) = db.mark_delivery_notice_sent(&notice.matrix_event_id).await
+                        {
+                            warn!(
+                                matrix_event_id = %notice.matrix_event_id,
+                                error = %e,
+                                "Failed to persist delivery notice completion"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            matrix_event_id = %notice.matrix_event_id,
+                            room_id = %room_id,
+                            error = %e,
+                            "Failed to post delivery-unconfirmed notice — releasing claim"
+                        );
+                        db.release_delivery_notice(&notice.matrix_event_id)
+                            .await
+                            .ok();
+                    }
+                }
+            }
+            Ok(None) => sleep(Duration::from_secs(60)).await,
+            Err(e) => {
+                error!(error = %e, "Delivery confirmation monitor failed to claim work");
+                sleep(Duration::from_secs(60)).await;
+            }
+        }
     }
 }
 

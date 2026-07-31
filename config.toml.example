@@ -50,6 +50,7 @@ from_address = "bot@example.com"   # address in the From header of bridge replie
 list_address = "list@lists.example.com"  # mailing list posting address (To + Reply-To)
 # require_smtps = false  # set true if your server requires implicit TLS on port 465
 # allow_new_threads_from_matrix = false  # true: top-level Matrix messages create new list emails
+# list_confirmation_timeout_secs = 3600  # optional: notify after 1h without a list echo; never auto-resends
 
 [limits]
 max_attachment_bytes = 10485760  # 10MB

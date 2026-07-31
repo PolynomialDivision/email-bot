@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::task::spawn_blocking;
@@ -15,6 +15,16 @@ pub struct SmtpRetryItem {
     pub matrix_event_id: String,
     pub smtp_payload: String,
     pub attempts: i64,
+}
+
+pub struct ConfirmationMatch {
+    pub matrix_event_id: String,
+    pub previous_status: String,
+}
+
+pub struct DeliveryNotice {
+    pub matrix_event_id: String,
+    pub room_id: String,
 }
 
 #[derive(Clone)]
@@ -69,7 +79,8 @@ impl Db {
             -- Bidirectional bridge routing table.
             -- origin='email': an email was posted to Matrix (smtp_* columns are NULL).
             -- origin='matrix': a Matrix reply is being sent as email.
-            --   smtp_status: 'pending' | 'sent' | 'failed'
+            --   smtp_status: 'pending' | 'failed' | 'smtp_accepted' |
+            --                'list_confirmed' | 'delivery_unconfirmed'
             CREATE TABLE IF NOT EXISTS message_routes (
                 matrix_event_id TEXT PRIMARY KEY,
                 email_message_id TEXT NOT NULL,
@@ -80,6 +91,12 @@ impl Db {
                 smtp_attempts INTEGER NOT NULL DEFAULT 0,
                 smtp_next_retry_at INTEGER,
                 smtp_payload TEXT,
+                room_id TEXT,
+                smtp_accepted_at INTEGER,
+                list_confirmed_at INTEGER,
+                delivery_unconfirmed_at INTEGER,
+                delivery_notice_claimed_at INTEGER,
+                delivery_notice_sent_at INTEGER,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_routes_email_id
@@ -93,6 +110,12 @@ impl Db {
             "ALTER TABLE message_routes ADD COLUMN smtp_attempts INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE message_routes ADD COLUMN smtp_next_retry_at INTEGER",
             "ALTER TABLE message_routes ADD COLUMN smtp_payload TEXT",
+            "ALTER TABLE message_routes ADD COLUMN room_id TEXT",
+            "ALTER TABLE message_routes ADD COLUMN smtp_accepted_at INTEGER",
+            "ALTER TABLE message_routes ADD COLUMN list_confirmed_at INTEGER",
+            "ALTER TABLE message_routes ADD COLUMN delivery_unconfirmed_at INTEGER",
+            "ALTER TABLE message_routes ADD COLUMN delivery_notice_claimed_at INTEGER",
+            "ALTER TABLE message_routes ADD COLUMN delivery_notice_sent_at INTEGER",
         ] {
             let _ = conn.execute(ddl, []);
         }
@@ -350,6 +373,7 @@ impl Db {
     pub async fn store_matrix_reply_pending(
         &self,
         matrix_event_id: &str,
+        room_id: &str,
         our_message_id: &str,
         thread_root_email_message_id: Option<&str>,
         subject: Option<&str>,
@@ -357,6 +381,7 @@ impl Db {
     ) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         let matrix_event_id = matrix_event_id.to_owned();
+        let room_id = room_id.to_owned();
         let our_message_id = our_message_id.to_owned();
         let thread_root_email_message_id = thread_root_email_message_id.map(str::to_owned);
         let subject = subject.map(str::to_owned);
@@ -367,14 +392,15 @@ impl Db {
             conn.execute(
                 "INSERT OR IGNORE INTO message_routes \
                  (matrix_event_id, email_message_id, thread_root_email_message_id, \
-                  subject, origin, smtp_status, smtp_attempts, smtp_payload, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'matrix', 'pending', 0, ?5, ?6)",
+                  subject, origin, smtp_status, smtp_attempts, smtp_payload, room_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'matrix', 'pending', 0, ?5, ?6, ?7)",
                 params![
                     matrix_event_id,
                     our_message_id,
                     thread_root_email_message_id,
                     subject,
                     smtp_payload,
+                    room_id,
                     now
                 ],
             )?;
@@ -384,29 +410,180 @@ impl Db {
         .context("spawn_blocking store_matrix_reply_pending")?
     }
 
-    pub async fn mark_route_sent(&self, matrix_event_id: &str) -> Result<()> {
+    pub async fn mark_route_smtp_accepted(&self, matrix_event_id: &str) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         let matrix_event_id = matrix_event_id.to_owned();
+        let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "UPDATE message_routes SET smtp_status = 'sent' \
-                 WHERE matrix_event_id = ?1",
-                params![matrix_event_id],
+                "UPDATE message_routes \
+                 SET smtp_status = 'smtp_accepted', smtp_accepted_at = ?1, smtp_next_retry_at = NULL \
+                 WHERE matrix_event_id = ?2 AND smtp_status IN ('pending', 'failed', 'sent')",
+                params![now, matrix_event_id],
             )?;
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("spawn_blocking mark_route_sent")?
+        .context("spawn_blocking mark_route_smtp_accepted")?
+    }
+
+    /// Confirm a mailing-list echo by exact Message-ID, falling back to the
+    /// Matrix event correlation header when the list rewrites Message-ID.
+    pub async fn confirm_list_delivery(
+        &self,
+        email_message_id: &str,
+        matrix_event_id: Option<&str>,
+    ) -> Result<Option<ConfirmationMatch>> {
+        let conn = Arc::clone(&self.conn);
+        let email_message_id = email_message_id.to_owned();
+        let matrix_event_id = matrix_event_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        let now = chrono::Utc::now().timestamp();
+        spawn_blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let matched = tx
+                .query_row(
+                    "SELECT matrix_event_id, smtp_status \
+                     FROM message_routes \
+                     WHERE origin = 'matrix' \
+                       AND (email_message_id = ?1 OR (?2 IS NOT NULL AND matrix_event_id = ?2)) \
+                       AND smtp_status IN ('pending', 'sent', 'smtp_accepted', 'delivery_unconfirmed') \
+                     LIMIT 1",
+                    params![email_message_id, matrix_event_id],
+                    |row| {
+                        Ok(ConfirmationMatch {
+                            matrix_event_id: row.get(0)?,
+                            previous_status: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ref matched) = matched {
+                tx.execute(
+                    "UPDATE message_routes \
+                     SET smtp_status = 'list_confirmed', list_confirmed_at = ?1, \
+                         delivery_notice_claimed_at = NULL \
+                     WHERE matrix_event_id = ?2",
+                    params![now, matched.matrix_event_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok::<Option<ConfirmationMatch>, anyhow::Error>(matched)
+        })
+        .await
+        .context("spawn_blocking confirm_list_delivery")?
+    }
+
+    /// Claim one overdue delivery notice. The lease makes this idempotent
+    /// across restarts and concurrent bot instances sharing the database.
+    pub async fn claim_unconfirmed_delivery(
+        &self,
+        timeout_secs: i64,
+        lease_secs: i64,
+    ) -> Result<Option<DeliveryNotice>> {
+        let conn = Arc::clone(&self.conn);
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - timeout_secs;
+        let stale_claim = now - lease_secs;
+        spawn_blocking(move || {
+            let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let candidate = tx
+                .query_row(
+                    "SELECT matrix_event_id, room_id \
+                     FROM message_routes \
+                     WHERE origin = 'matrix' AND room_id IS NOT NULL \
+                       AND delivery_notice_sent_at IS NULL \
+                       AND (delivery_notice_claimed_at IS NULL OR delivery_notice_claimed_at <= ?1) \
+                       AND ((smtp_status = 'smtp_accepted' AND smtp_accepted_at <= ?2) \
+                            OR smtp_status = 'delivery_unconfirmed') \
+                     ORDER BY COALESCE(smtp_accepted_at, created_at) ASC \
+                     LIMIT 1",
+                    params![stale_claim, cutoff],
+                    |row| {
+                        Ok(DeliveryNotice {
+                            matrix_event_id: row.get(0)?,
+                            room_id: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(ref candidate) = candidate {
+                tx.execute(
+                    "UPDATE message_routes \
+                     SET smtp_status = 'delivery_unconfirmed', \
+                         delivery_unconfirmed_at = COALESCE(delivery_unconfirmed_at, ?1), \
+                         delivery_notice_claimed_at = ?1 \
+                     WHERE matrix_event_id = ?2",
+                    params![now, candidate.matrix_event_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok::<Option<DeliveryNotice>, anyhow::Error>(candidate)
+        })
+        .await
+        .context("spawn_blocking claim_unconfirmed_delivery")?
+    }
+
+    pub async fn mark_delivery_notice_sent(&self, matrix_event_id: &str) -> Result<()> {
+        self.finish_delivery_notice(matrix_event_id, true).await
+    }
+
+    pub async fn delivery_notice_is_active(&self, matrix_event_id: &str) -> Result<bool> {
+        let conn = Arc::clone(&self.conn);
+        let matrix_event_id = matrix_event_id.to_owned();
+        spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM message_routes \
+                 WHERE matrix_event_id = ?1 AND smtp_status = 'delivery_unconfirmed' \
+                   AND delivery_notice_claimed_at IS NOT NULL \
+                   AND delivery_notice_sent_at IS NULL",
+                params![matrix_event_id],
+                |row| row.get(0),
+            )?;
+            Ok::<bool, anyhow::Error>(count > 0)
+        })
+        .await
+        .context("spawn_blocking delivery_notice_is_active")?
+    }
+
+    pub async fn release_delivery_notice(&self, matrix_event_id: &str) -> Result<()> {
+        self.finish_delivery_notice(matrix_event_id, false).await
+    }
+
+    async fn finish_delivery_notice(&self, matrix_event_id: &str, sent: bool) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let matrix_event_id = matrix_event_id.to_owned();
+        let now = chrono::Utc::now().timestamp();
+        spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            if sent {
+                conn.execute(
+                    "UPDATE message_routes \
+                     SET delivery_notice_sent_at = ?1, delivery_notice_claimed_at = NULL \
+                     WHERE matrix_event_id = ?2 AND smtp_status = 'delivery_unconfirmed'",
+                    params![now, matrix_event_id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE message_routes SET delivery_notice_claimed_at = NULL \
+                     WHERE matrix_event_id = ?1 AND smtp_status = 'delivery_unconfirmed'",
+                    params![matrix_event_id],
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("spawn_blocking finish_delivery_notice")?
     }
 
     /// Increment attempt counter and schedule next retry.
     /// Records with smtp_attempts ≥ 10 are no longer returned by get_failed_smtp_routes.
-    pub async fn mark_route_failed(
-        &self,
-        matrix_event_id: &str,
-        next_retry_at: i64,
-    ) -> Result<()> {
+    pub async fn mark_route_failed(&self, matrix_event_id: &str, next_retry_at: i64) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         let matrix_event_id = matrix_event_id.to_owned();
         spawn_blocking(move || {
@@ -416,7 +593,7 @@ impl Db {
                  SET smtp_status = 'failed', \
                      smtp_attempts = smtp_attempts + 1, \
                      smtp_next_retry_at = ?1 \
-                 WHERE matrix_event_id = ?2",
+                 WHERE matrix_event_id = ?2 AND smtp_status IN ('pending', 'failed')",
                 params![next_retry_at, matrix_event_id],
             )?;
             Ok::<(), anyhow::Error>(())
@@ -482,8 +659,8 @@ impl Db {
         .context("spawn_blocking get_next_smtp_retry_at")?
     }
 
-    /// Returns true only for emails that were successfully delivered by the bridge (smtp_status='sent').
-    /// Used to break the email→Matrix echo loop.
+    /// Returns true for emails accepted by SMTP, including confirmed and
+    /// unconfirmed list-delivery states. Used to break the echo loop.
     pub async fn is_bridge_sent_email(&self, email_message_id: &str) -> Result<bool> {
         let conn = Arc::clone(&self.conn);
         let email_message_id = email_message_id.to_owned();
@@ -491,7 +668,8 @@ impl Db {
             let conn = conn.lock().unwrap();
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM message_routes \
-                 WHERE email_message_id = ?1 AND origin = 'matrix' AND smtp_status = 'sent'",
+                 WHERE email_message_id = ?1 AND origin = 'matrix' \
+                   AND smtp_status IN ('sent', 'smtp_accepted', 'list_confirmed', 'delivery_unconfirmed')",
                 params![email_message_id],
                 |row| row.get(0),
             )?;
@@ -514,5 +692,218 @@ impl Db {
         })
         .await
         .context("spawn_blocking cleanup_old_threads")?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::Db;
+
+    fn test_db() -> (TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("email-bot.sqlite3")).unwrap();
+        (dir, db)
+    }
+
+    async fn accepted_route(db: &Db, event_id: &str, message_id: &str) {
+        db.store_matrix_reply_pending(
+            event_id,
+            "!room:example.org",
+            message_id,
+            Some(message_id),
+            Some("subject"),
+            "{}",
+        )
+        .await
+        .unwrap();
+        db.mark_route_smtp_accepted(event_id).await.unwrap();
+    }
+
+    fn make_overdue(db: &Db, event_id: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE message_routes SET smtp_accepted_at = ?1 WHERE matrix_event_id = ?2",
+            rusqlite::params![chrono::Utc::now().timestamp() - 7200, event_id],
+        )
+        .unwrap();
+    }
+
+    fn route_state(db: &Db, event_id: &str) -> (String, i64, String) {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT smtp_status, smtp_attempts, email_message_id \
+             FROM message_routes WHERE matrix_event_id = ?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_copy_received_before_timeout() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "message@example.org").await;
+
+        let matched = db
+            .confirm_list_delivery("message@example.org", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.matrix_event_id, "$event");
+        assert_eq!(matched.previous_status, "smtp_accepted");
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delayed_list_copy_received_before_notice_claim() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "message@example.org").await;
+        make_overdue(&db, "$event");
+
+        db.confirm_list_delivery("message@example.org", None)
+            .await
+            .unwrap();
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fast_list_copy_is_not_overwritten_by_smtp_acceptance_update() {
+        let (_dir, db) = test_db();
+        db.store_matrix_reply_pending(
+            "$event",
+            "!room:example.org",
+            "message@example.org",
+            None,
+            Some("subject"),
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        db.confirm_list_delivery("message@example.org", Some("$event"))
+            .await
+            .unwrap();
+        db.mark_route_smtp_accepted("$event").await.unwrap();
+
+        assert_eq!(route_state(&db, "$event").0, "list_confirmed");
+    }
+
+    #[tokio::test]
+    async fn list_copy_after_claim_suppresses_notice() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "message@example.org").await;
+        make_overdue(&db, "$event");
+
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_some());
+        db.confirm_list_delivery("message@example.org", None)
+            .await
+            .unwrap();
+        assert!(!db.delivery_notice_is_active("$event").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn duplicate_scheduler_execution_claims_once() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "message@example.org").await;
+        make_overdue(&db, "$event");
+
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_none());
+        db.mark_delivery_notice_sent("$event").await.unwrap();
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn waiting_period_survives_restart() {
+        let (dir, db) = test_db();
+        let path = dir.path().join("email-bot.sqlite3");
+        accepted_route(&db, "$event", "message@example.org").await;
+        make_overdue(&db, "$event");
+        drop(db);
+
+        let reopened = Db::open(path).unwrap();
+        assert!(reopened
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn rewritten_message_id_uses_matrix_event_header() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "original@example.org").await;
+
+        let matched = db
+            .confirm_list_delivery("rewritten@list.example", Some("$event"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.matrix_event_id, "$event");
+        assert_eq!(route_state(&db, "$event").0, "list_confirmed");
+    }
+
+    #[tokio::test]
+    async fn stripped_custom_header_falls_back_to_message_id() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "original@example.org").await;
+
+        assert!(db
+            .confirm_list_delivery("original@example.org", None)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn no_correlation_marks_unconfirmed_without_resending() {
+        let (_dir, db) = test_db();
+        accepted_route(&db, "$event", "original@example.org").await;
+        make_overdue(&db, "$event");
+
+        assert!(db
+            .confirm_list_delivery("rewritten@list.example", None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .claim_unconfirmed_delivery(3600, 300)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            route_state(&db, "$event"),
+            (
+                "delivery_unconfirmed".to_owned(),
+                0,
+                "original@example.org".to_owned()
+            )
+        );
     }
 }

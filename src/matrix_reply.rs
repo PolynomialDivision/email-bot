@@ -250,6 +250,7 @@ async fn handle_thread_reply(
     let smtp_reply = SmtpReply::new(
         display_name.clone(),
         ev.sender.to_string(),
+        event_id.to_owned(),
         in_reply_to_email_id.clone(),
         references,
         subject.clone(),
@@ -259,6 +260,7 @@ async fn handle_thread_reply(
     send_matrix_email(
         &state,
         event_id,
+        room.room_id().as_str(),
         sender,
         &display_name,
         &smtp_reply,
@@ -295,6 +297,7 @@ async fn handle_new_thread_message(
     let smtp_reply = SmtpReply::new_thread(
         display_name.clone(),
         ev.sender.to_string(),
+        event_id.to_owned(),
         subject.clone(),
         body,
     );
@@ -321,6 +324,7 @@ async fn handle_new_thread_message(
     send_matrix_email(
         &state,
         event_id,
+        room.room_id().as_str(),
         sender,
         &display_name,
         &smtp_reply,
@@ -335,6 +339,7 @@ async fn handle_new_thread_message(
 async fn send_matrix_email(
     state: &ReplyState,
     event_id: &str,
+    room_id: &str,
     sender: &str,
     display_name: &str,
     smtp_reply: &SmtpReply,
@@ -361,6 +366,7 @@ async fn send_matrix_email(
         .db
         .store_matrix_reply_pending(
             event_id,
+            room_id,
             &smtp_reply.our_message_id,
             thread_root_email_message_id,
             subject,
@@ -392,12 +398,12 @@ async fn send_matrix_email(
                 event_id = event_id,
                 our_message_id = %smtp_reply.our_message_id,
                 elapsed_ms = t.elapsed().as_millis(),
-                "SMTP delivery succeeded — marking route SENT"
+                "SMTP accepted message — awaiting optional list confirmation"
             );
-            if let Err(e) = state.db.mark_route_sent(event_id).await {
-                warn!(event_id = event_id, error = %e, "Failed to mark route SENT (will retry as PENDING)");
+            if let Err(e) = state.db.mark_route_smtp_accepted(event_id).await {
+                warn!(event_id = event_id, error = %e, "Failed to mark route SMTP_ACCEPTED (will retry as PENDING)");
             } else {
-                debug!(event_id = event_id, "Route state: SENT");
+                debug!(event_id = event_id, "Route state: SMTP_ACCEPTED");
             }
         }
         Err(e) => {
