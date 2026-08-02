@@ -1,18 +1,15 @@
 use matrix_sdk::{
-    Client, Room, RoomState,
     ruma::{
-        OwnedServerName, OwnedUserId, RoomOrAliasId,
         events::{
-            key::verification::request::ToDeviceKeyVerificationRequestEvent,
             room::member::StrippedRoomMemberEvent,
             room::message::{MessageType, OriginalSyncRoomMessageEvent},
         },
+        OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
+    Client, Room, RoomState,
 };
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{RoomAllowList, UserAllowList};
@@ -23,7 +20,7 @@ pub struct BotState {
     pub allowed_inviters: UserAllowList,
     pub allowed_rooms: RoomAllowList,
     pub admin_users: HashSet<OwnedUserId>,
-    pub reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    pub verification: mxbot_common::verify::VerificationService,
 }
 
 pub fn register_handlers(client: &Client, state: BotState) {
@@ -123,52 +120,13 @@ pub fn register_handlers(client: &Client, state: BotState) {
         }
     });
 
-    // To-device verification requests
+    // Verification requests are handled by mxbot-common. This room handler
+    // only consumes the shared administrative commands.
     client.add_event_handler({
         let state = state.clone();
-        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let state = state.clone();
             async move {
-                let Some(request) = client
-                    .encryption()
-                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                    .await
-                else {
-                    warn!("to-device verification request object not found");
-                    return;
-                };
-                tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client,
-                    Arc::clone(&state.reset_allowed),
-                    request,
-                ));
-            }
-        }
-    });
-
-    // In-room messages: verification requests and !reset-trust command
-    client.add_event_handler({
-        let state = state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
-            let state = state.clone();
-            async move {
-                if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
-                    let Some(request) = client
-                        .encryption()
-                        .get_verification_request(&ev.sender, &ev.event_id)
-                        .await
-                    else {
-                        warn!("in-room verification request object not found");
-                        return;
-                    };
-                    tokio::spawn(mxbot_common::verify::handle_verification_request(
-                        client,
-                        Arc::clone(&state.reset_allowed),
-                        request,
-                    ));
-                    return;
-                }
-
                 if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
                     return;
                 }
@@ -177,25 +135,10 @@ pub fn register_handlers(client: &Client, state: BotState) {
                     return;
                 };
                 let raw = text.body.trim();
-
-                if let Some(target) = raw.strip_prefix("!reset-trust ") {
-                    if state.admin_users.contains(&ev.sender) {
-                        match target.trim().parse::<OwnedUserId>() {
-                            Ok(target_user) => {
-                                state.reset_allowed.lock().await.insert(target_user.clone());
-                                info!(
-                                    "Trust reset allowed for {} (by {})",
-                                    target_user, ev.sender
-                                );
-                            }
-                            Err(_) => {
-                                warn!("!reset-trust: invalid user ID '{}'", target.trim())
-                            }
-                        }
-                    } else {
-                        warn!("!reset-trust from non-admin {} — ignored", ev.sender);
-                    }
-                }
+                state
+                    .verification
+                    .handle_admin_command(&ev.sender, &state.admin_users, raw)
+                    .await;
             }
         }
     });

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
@@ -30,6 +30,7 @@ use config::{
 };
 use db::Db;
 use email::{ParsedEmail, RawEmail};
+use mxbot_common::verify::VerificationService;
 use verify::BotState;
 
 fn install_panic_hook() {
@@ -158,6 +159,19 @@ async fn main() -> Result<()> {
     .await
     .context("Matrix client setup failed")?;
 
+    let verification_fallback = match &allowed_inviters {
+        config::UserAllowList::Explicit(users) => {
+            users.iter().map(ToString::to_string).collect::<Vec<_>>()
+        }
+        config::UserAllowList::All | config::UserAllowList::Deny => Vec::new(),
+    };
+    let verification = VerificationService::allowlisted_tofu_from_config(
+        client.clone(),
+        &config.security.verification,
+        &verification_fallback,
+    );
+    verification.install_handlers();
+
     if admin_users.is_empty() {
         warn!("No admin_users configured — !reset-trust command is disabled");
     } else {
@@ -194,7 +208,7 @@ async fn main() -> Result<()> {
         allowed_inviters: allowed_inviters.clone(),
         allowed_rooms: allowed_rooms.clone(),
         admin_users,
-        reset_allowed: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        verification,
     };
 
     verify::register_handlers(&client, bot_state);
@@ -949,11 +963,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                     "email-delivery-unconfirmed:{}",
                     notice.matrix_event_id
                 ));
-                match room
-                    .send(content)
-                    .with_transaction_id(transaction_id)
-                    .await
-                {
+                match room.send(content).with_transaction_id(transaction_id).await {
                     Ok(_) => {
                         info!(
                             matrix_event_id = %notice.matrix_event_id,

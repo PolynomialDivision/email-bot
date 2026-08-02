@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 
-pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig};
+pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig, VerificationConfig};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -167,6 +167,8 @@ pub struct SecurityConfig {
     pub allowed_repliers: Vec<String>,
     #[serde(default)]
     pub encryption_strategy: EncryptionStrategy,
+    #[serde(default)]
+    pub verification: VerificationConfig,
 }
 
 #[derive(Deserialize, Clone)]
