@@ -252,10 +252,7 @@ mod tests {
     #[test]
     fn test_clean_subject_strips_list_prefix() {
         assert_eq!(clean_subject("[mylist] Hello world"), "Hello world");
-        assert_eq!(
-            clean_subject("[mylist] [sub] Hello world"),
-            "Hello world"
-        );
+        assert_eq!(clean_subject("[mylist] [sub] Hello world"), "Hello world");
     }
 
     #[test]

@@ -67,7 +67,10 @@ pub struct ParsedEmail {
 }
 
 fn clean_message_id(id: &str) -> String {
-    id.trim().trim_start_matches('<').trim_end_matches('>').to_owned()
+    id.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_owned()
 }
 
 fn extract_from(msg: &mail_parser::Message) -> (Option<String>, String) {
@@ -186,9 +189,13 @@ fn extract_list_id(msg: &mail_parser::Message) -> Option<String> {
             HeaderValue::Address(Address::List(list)) => {
                 list.first()?.address.as_deref().map(str::to_owned)
             }
-            HeaderValue::Address(Address::Group(groups)) => {
-                groups.first()?.addresses.first()?.address.as_deref().map(str::to_owned)
-            }
+            HeaderValue::Address(Address::Group(groups)) => groups
+                .first()?
+                .addresses
+                .first()?
+                .address
+                .as_deref()
+                .map(str::to_owned),
             _ => None,
         }
     };
@@ -216,7 +223,13 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
 
     let msg = mail_parser::MessageParser::default()
         .parse(&raw.raw)
-        .ok_or_else(|| anyhow!("mail-parser failed to parse email uid={} (raw bytes: {})", raw.uid, raw.raw.len()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "mail-parser failed to parse email uid={} (raw bytes: {})",
+                raw.uid,
+                raw.raw.len()
+            )
+        })?;
 
     let message_id = clean_message_id(msg.message_id().unwrap_or(""));
     let message_id = if message_id.is_empty() {
@@ -233,7 +246,9 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
     let subject = msg.subject().unwrap_or("(no subject)").to_owned();
     let (from_name, from_email) = extract_from(&msg);
 
-    let date = msg.date().and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0));
+    let date = msg
+        .date()
+        .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0));
 
     let list_id = extract_list_id(&msg);
     let bridge_origin = extract_bridge_origin(&msg);
@@ -291,10 +306,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
         match msg.attachment(i as u32) {
             Some(att) => {
                 i += 1;
-                let filename = att
-                    .attachment_name()
-                    .unwrap_or("attachment")
-                    .to_owned();
+                let filename = att.attachment_name().unwrap_or("attachment").to_owned();
                 let content_type = if let Some(ct) = att.content_type() {
                     let subtype = ct.c_subtype.as_deref().unwrap_or("octet-stream");
                     format!("{}/{}", ct.c_type, subtype)
@@ -466,10 +478,7 @@ mod tests {
 
     #[test]
     fn test_clean_message_id_strips_brackets() {
-        assert_eq!(
-            clean_message_id("<abc@example.com>"),
-            "abc@example.com"
-        );
+        assert_eq!(clean_message_id("<abc@example.com>"), "abc@example.com");
         assert_eq!(clean_message_id("abc@example.com"), "abc@example.com");
         assert_eq!(clean_message_id("  <abc@def>  "), "abc@def");
     }
@@ -487,12 +496,17 @@ mod tests {
         assert_eq!(parsed.message_id, "test123@example.com");
         assert_eq!(parsed.subject, "Hello");
         assert_eq!(parsed.from_email, "test@example.com");
-        assert!(parsed.body_plain.as_deref().unwrap_or("").contains("Body text here."));
+        assert!(parsed
+            .body_plain
+            .as_deref()
+            .unwrap_or("")
+            .contains("Body text here."));
     }
 
     #[test]
     fn test_parse_empty_body() {
-        let raw_bytes = b"From: test@example.com\r\nSubject: Empty\r\nMessage-ID: <empty@example.com>\r\n\r\n";
+        let raw_bytes =
+            b"From: test@example.com\r\nSubject: Empty\r\nMessage-ID: <empty@example.com>\r\n\r\n";
         let raw = RawEmail {
             uid: 2,
             mailbox: "INBOX".to_owned(),

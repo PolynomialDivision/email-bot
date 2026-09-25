@@ -160,10 +160,7 @@ impl Db {
         .context("spawn_blocking mark_uid_seen")?
     }
 
-    pub async fn get_thread_root(
-        &self,
-        message_id: &str,
-    ) -> Result<Option<(String, String)>> {
+    pub async fn get_thread_root(&self, message_id: &str) -> Result<Option<(String, String)>> {
         let conn = Arc::clone(&self.conn);
         let message_id = message_id.to_owned();
         spawn_blocking(move || {

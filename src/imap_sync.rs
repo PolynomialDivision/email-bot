@@ -342,7 +342,11 @@ async fn fetch_all_uids(
         .context("IMAP UID SEARCH ALL failed")?;
     let mut result: Vec<u32> = uids.into_iter().collect();
     result.sort_unstable();
-    debug!(uid_count = result.len(), "IMAP: UID SEARCH ALL returned {} UIDs", result.len());
+    debug!(
+        uid_count = result.len(),
+        "IMAP: UID SEARCH ALL returned {} UIDs",
+        result.len()
+    );
     Ok(result)
 }
 
@@ -357,7 +361,12 @@ async fn fetch_uids_since(
         .await
         .context("IMAP UID SEARCH since last failed")?;
     let result: Vec<u32> = uids.into_iter().filter(|&uid| uid > last_uid).collect();
-    debug!(uid_count = result.len(), last_uid = last_uid, "IMAP: UID SEARCH returned {} new UIDs", result.len());
+    debug!(
+        uid_count = result.len(),
+        last_uid = last_uid,
+        "IMAP: UID SEARCH returned {} new UIDs",
+        result.len()
+    );
     Ok(result)
 }
 
@@ -375,8 +384,7 @@ async fn fetch_raw_email(
     tokio::pin!(stream);
 
     while let Some(result) = stream.next().await {
-        let fetch = result
-            .with_context(|| format!("IMAP fetch stream error for UID {}", uid))?;
+        let fetch = result.with_context(|| format!("IMAP fetch stream error for UID {}", uid))?;
         if let Some(body) = fetch.body() {
             debug!(uid = uid, bytes = body.len(), "IMAP: RFC822 body received");
             return Ok(Some(body.to_vec()));
