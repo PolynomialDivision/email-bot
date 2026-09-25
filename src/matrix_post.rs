@@ -1,22 +1,31 @@
 use anyhow::{Context, Result};
-use matrix_sdk::ruma::events::relation::Thread;
-use matrix_sdk::ruma::events::room::message::{MessageType, Relation, RoomMessageEventContent};
-use matrix_sdk::ruma::events::room::ImageInfo;
-use matrix_sdk::ruma::{OwnedEventId, UInt};
-use matrix_sdk::{Client, RoomState};
+use mxbot_common::matrix_sdk::{
+    self,
+    ruma::{
+        events::{
+            relation::Thread,
+            room::{
+                message::{MessageType, Relation, RoomMessageEventContent},
+                ImageInfo,
+            },
+        },
+        OwnedEventId, UInt,
+    },
+    RoomState,
+};
+use mxbot_common::Bot;
 use tracing::{debug, info, warn};
 
-use crate::config::{LimitsConfig, RoomAllowList};
+use crate::config::LimitsConfig;
 use crate::db::Db;
 use crate::email::ParsedEmail;
 use crate::format::format_email;
 
 pub async fn post_email(
-    client: &Client,
+    bot: &Bot,
     email: &ParsedEmail,
     db: &Db,
     limits: &LimitsConfig,
-    allowed_rooms: &RoomAllowList,
 ) -> Result<()> {
     debug!(
         uid = email.uid,
@@ -92,11 +101,10 @@ pub async fn post_email(
         }
     }
 
-    let rooms: Vec<_> = client
-        .joined_rooms()
+    let rooms: Vec<_> = bot
+        .broadcast_rooms()
         .into_iter()
         .filter(|r| r.state() == RoomState::Joined)
-        .filter(|r| allowed_rooms.allows(r.room_id()))
         .collect();
 
     if rooms.is_empty() {
@@ -188,24 +196,18 @@ pub async fn post_email(
             count = email.attachments.len(),
             "matrix_post: posting attachments"
         );
-        post_attachments(client, email, limits, allowed_rooms).await;
+        post_attachments(bot, email, limits).await;
     }
 
     Ok(())
 }
 
-async fn post_attachments(
-    client: &Client,
-    email: &ParsedEmail,
-    limits: &LimitsConfig,
-    allowed_rooms: &RoomAllowList,
-) {
+async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig) {
     let max_bytes = limits.effective_max_attachment_bytes();
-    let rooms: Vec<_> = client
-        .joined_rooms()
+    let rooms: Vec<_> = bot
+        .broadcast_rooms()
         .into_iter()
         .filter(|r| r.state() == RoomState::Joined)
-        .filter(|r| allowed_rooms.allows(r.room_id()))
         .collect();
 
     for (idx, attachment) in email.attachments.iter().enumerate() {
@@ -243,7 +245,8 @@ async fn post_attachments(
             "matrix_post: uploading attachment to Matrix media store"
         );
         let t_upload = std::time::Instant::now();
-        match client
+        match bot
+            .client
             .media()
             .upload(&mime, attachment.data.clone(), None)
             .await

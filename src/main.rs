@@ -1,13 +1,17 @@
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{future::Future, time::Duration};
 
 use anyhow::{Context, Result};
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition, events::room::message::RoomMessageEventContent,
-        OwnedRoomId, OwnedServerName, OwnedTransactionId, RoomOrAliasId,
+use mxbot_common::{
+    admin::Dispatch,
+    matrix_sdk::{
+        deserialized_responses::EncryptionInfo,
+        ruma::{
+            events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+            OwnedRoomId, OwnedTransactionId,
+        },
+        Client, Room, RoomState,
     },
-    Client,
+    Bot,
 };
 use serde_json;
 use tokio::{fs, signal, sync::mpsc, time::sleep};
@@ -22,16 +26,10 @@ mod imap_sync;
 mod matrix_post;
 mod matrix_reply;
 mod smtp_send;
-mod verify;
 
-use config::{
-    parse_admin_users, parse_allowed_inviters, parse_allowed_repliers, parse_allowed_rooms, Config,
-    Secrets,
-};
+use config::{parse_allowed_repliers, Config, Secrets};
 use db::Db;
 use email::{ParsedEmail, RawEmail};
-use mxbot_common::verify::VerificationService;
-use verify::BotState;
 
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
@@ -79,14 +77,9 @@ async fn main() -> Result<()> {
     //   RUST_LOG=debug                         — verbose, includes all internal state
     //   RUST_LOG=email_bot=debug,warn          — debug this crate, quiet external crates
     //   RUST_LOG=email_bot=debug,matrix_sdk=info,warn
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .with_thread_ids(true)
-        .init();
+    // RUST_LOG overrides the default (email_bot=info, SDK at warn), e.g.
+    //   RUST_LOG=email_bot=debug,warn
+    mxbot_common::logging::init("email_bot");
 
     install_panic_hook();
 
@@ -98,17 +91,10 @@ async fn main() -> Result<()> {
          RUST_BACKTRACE=1               — print stack traces on panic"
     );
 
-    let config_path = std::env::args()
-        .find(|a| a.ends_with(".toml"))
-        .unwrap_or_else(|| "config.toml".to_owned());
-
-    info!(config_path = %config_path, "Loading config");
-    let config_str = fs::read_to_string(&config_path)
-        .await
-        .with_context(|| format!("Reading config file {}", config_path))?;
-    let config: Config = toml::from_str(&config_str)
-        .context("Parsing config TOML — check for missing required fields")?;
-    info!(config_path = %config_path, "Config loaded successfully");
+    let config_path = mxbot_common::config::config_path_from_args();
+    info!(config_path = %config_path.display(), "Loading config");
+    let config: Config = mxbot_common::config::load_toml(&config_path)?;
+    info!(config_path = %config_path.display(), "Config loaded successfully");
 
     let secrets = Secrets::from_env().context("Loading secrets from environment")?;
     debug!(
@@ -118,8 +104,7 @@ async fn main() -> Result<()> {
     );
 
     // Init store directory and database
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
+    let store_path = mxbot_common::config::store_path_from_env();
     debug!(store_path = %store_path.display(), "Ensuring store directory exists");
     fs::create_dir_all(&store_path)
         .await
@@ -133,16 +118,12 @@ async fn main() -> Result<()> {
     // Print startup diagnostics before touching Matrix
     print_startup_diagnostics(&config, &secrets, &db_path);
 
-    // Destructure security config all at once to avoid partial-move issues
-    let admin_users = parse_admin_users(&config.security);
-    let allowed_inviters = parse_allowed_inviters(&config.security)
-        .context("Invalid allowed_inviters in [security] config")?;
-    let allowed_rooms = parse_allowed_rooms(&config.security)
-        .context("Invalid allowed_rooms in [security] config")?;
     let allowed_repliers = parse_allowed_repliers(&config.security)
         .context("Invalid allowed_repliers in [security] config")?;
-    let encryption_strategy = config.security.encryption_strategy;
-    info!(strategy = ?encryption_strategy, "Encryption strategy configured");
+    info!(strategy = ?config.security.common.encryption_strategy, "Encryption strategy configured");
+    if config.security.common.allowed_rooms.is_none() {
+        warn!("allowed_rooms = [] — bot will not operate in any room");
+    }
 
     info!(
         homeserver = %config.matrix.homeserver,
@@ -151,68 +132,11 @@ async fn main() -> Result<()> {
         store_path = %store_path.display(),
         "Building Matrix client"
     );
-    let (client, user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        encryption_strategy.into(),
-    )
-    .await
-    .context("Matrix client setup failed")?;
-
-    let verification_fallback = match &allowed_inviters {
-        config::UserAllowList::Explicit(users) => {
-            users.iter().map(ToString::to_string).collect::<Vec<_>>()
-        }
-        config::UserAllowList::All | config::UserAllowList::Deny => Vec::new(),
-    };
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        client.clone(),
-        &config.security.verification,
-        &verification_fallback,
-    );
-    verification.install_handlers();
-
-    if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command is disabled");
-    } else {
-        info!(
-            count = admin_users.len(),
-            users = ?admin_users,
-            "Admin users configured"
-        );
-    }
-
-    if allowed_inviters.is_deny_all() {
-        warn!("allowed_inviters = [] — bot will reject all invites");
-    } else if allowed_inviters.is_allow_all() {
-        warn!("allowed_inviters = \"all\" — bot will accept invites from any Matrix user");
-    } else {
-        info!(
-            count = allowed_inviters.explicit_count().unwrap_or(0),
-            "Allowed inviters configured (explicit list)"
-        );
-    }
-    if allowed_rooms.is_deny_all() {
-        warn!("allowed_rooms = [] — bot will not operate in any room");
-    } else if allowed_rooms.is_allow_all() {
-        info!("allowed_rooms = \"all\" — bot will operate in any joined room");
-    } else {
-        info!(
-            count = allowed_rooms.explicit_count().unwrap_or(0),
-            "Allowed rooms configured (explicit list)"
-        );
-    }
-
-    let bot_state = BotState {
-        bot_user_id: user_id.clone(),
-        allowed_inviters: allowed_inviters.clone(),
-        allowed_rooms: allowed_rooms.clone(),
-        admin_users,
-        verification,
-    };
-
-    verify::register_handlers(&client, bot_state);
-    debug!("Matrix verification event handlers registered");
+    let bot = Bot::builder("email-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .start(&config.matrix, &config.security.common)
+        .await
+        .context("Matrix client setup failed")?;
 
     // Clone smtp config so both the reply handler and the retry worker can own a copy.
     let smtp_config_opt = config.smtp.clone();
@@ -221,6 +145,7 @@ async fn main() -> Result<()> {
         .and_then(|smtp| smtp.list_confirmation_timeout_secs)
         .map(|seconds| seconds.max(300));
 
+    let mut reply_state = None;
     if let Some(smtp_config) = config.smtp {
         match secrets.smtp_password {
             Some(ref smtp_password) => {
@@ -246,18 +171,14 @@ async fn main() -> Result<()> {
                         "All room members may send email replies (no allowed_repliers restriction)"
                     );
                 }
-                matrix_reply::register_reply_handler(
-                    &client,
-                    matrix_reply::ReplyState {
-                        bot_user_id: user_id.clone(),
-                        allowed_repliers,
-                        smtp_config,
-                        smtp_password: smtp_password.clone(),
-                        db: db.clone(),
-                        allowed_rooms: allowed_rooms.clone(),
-                    },
-                );
-                info!("Matrix→Email reply event handler registered");
+                reply_state = Some(matrix_reply::ReplyState {
+                    bot_user_id: bot.user_id.clone(),
+                    allowed_repliers,
+                    smtp_config,
+                    smtp_password: smtp_password.clone(),
+                    db: db.clone(),
+                    allowed_rooms: config.security.common.allowed_rooms.clone(),
+                });
             }
             None => {
                 warn!(
@@ -271,73 +192,41 @@ async fn main() -> Result<()> {
         info!("No [smtp] section in config — Matrix→Email reply bridging disabled");
     }
 
-    // Initial sync to populate room state before processing emails
+    // Room messages: admin console first; everything else outside admin
+    // direct chats may be a reply to bridge to email.
+    bot.client.add_event_handler({
+        let bot = bot.clone();
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            let bot = bot.clone();
+            let reply_state = reply_state.clone();
+            async move {
+                if room.state() == RoomState::Joined
+                    && bot.admin.handle(&room, &ev, encryption.as_ref()).await == Dispatch::Handled
+                {
+                    return;
+                }
+                if bot.admin.is_admin_dm(&room) {
+                    return;
+                }
+                if let Some(state) = reply_state {
+                    matrix_reply::handle_possible_reply(state, room, ev).await;
+                }
+            }
+        }
+    });
+
+    // Initial sync to populate room state before processing emails (also
+    // processes invites received while offline).
     info!("Performing initial Matrix sync (lazy loading)...");
     let t_sync0 = std::time::Instant::now();
-    let filter = FilterDefinition::with_lazy_loading();
-    client
-        .sync_once(SyncSettings::default().filter(filter.clone().into()))
-        .await
-        .context("Initial Matrix sync failed")?;
+    bot.initial_sync().await;
     info!(
         elapsed_ms = t_sync0.elapsed().as_millis(),
         "Initial Matrix sync complete"
     );
 
-    // Drain pending invites that were stored in the session from a prior run.
-    // StrippedRoomMemberEvent fires for new invites during this session only —
-    // it does NOT re-fire for invites already persisted in the SQLite store.
     {
-        let invited = client.invited_rooms();
-        if invited.is_empty() {
-            debug!("No pending invites after initial sync");
-        } else {
-            info!(
-                count = invited.len(),
-                "Pending invite(s) found after initial sync — processing"
-            );
-            for room in invited {
-                let room_id = room.room_id().to_owned();
-                // Inviter info is unavailable when replaying from the store.
-                // Decline all if configured; otherwise can only check room.
-                if allowed_inviters.is_deny_all() {
-                    warn!(room_id = %room_id, "Pending invite declined: allowed_inviters = []");
-                    room.leave().await.ok();
-                    continue;
-                }
-                if !allowed_rooms.allows(&room_id) {
-                    warn!(room_id = %room_id, "Pending invite declined: room not in allowed_rooms");
-                    room.leave().await.ok();
-                    continue;
-                }
-                // Build via servers from the room ID's server (inviter server is unavailable
-                // here since we're replaying from the store, not a live event).
-                let via: Vec<OwnedServerName> = room_id
-                    .server_name()
-                    .map(|s| vec![s.to_owned()])
-                    .unwrap_or_default();
-                match RoomOrAliasId::parse(room_id.as_str()) {
-                    Ok(room_or_alias) => {
-                        info!(room_id = %room_id, via = ?via, "Joining pending invite room");
-                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => {
-                                info!(room_id = %room_id, "Joined pending invite room successfully")
-                            }
-                            Err(e) => {
-                                warn!(room_id = %room_id, error = %e, "Failed to join pending invite room")
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(room_id = %room_id, error = %e, "Invalid room ID in pending invite — skipping")
-                    }
-                }
-            }
-        }
-    }
-
-    {
-        let rooms = client.joined_rooms();
+        let rooms = bot.client.joined_rooms();
         info!(room_count = rooms.len(), "Joined rooms after initial sync");
         for room in &rooms {
             debug!(
@@ -352,9 +241,9 @@ async fn main() -> Result<()> {
                  Invite the bot to a Matrix room."
             );
         }
-        if !allowed_rooms.is_allow_all() {
+        if !config.security.common.allowed_rooms.is_all() {
             for room in &rooms {
-                if !allowed_rooms.allows(room.room_id()) {
+                if !config.security.common.allowed_rooms.allows(room.room_id()) {
                     warn!(
                         room_id = %room.room_id(),
                         name = ?room.name(),
@@ -380,18 +269,16 @@ async fn main() -> Result<()> {
     });
 
     let db_sender = db.clone();
-    let client_sender = client.clone();
+    let bot_sender = bot.clone();
     let limits_sender = limits_config.clone();
     let mailing_list_sender = mailing_list_config.clone();
-    let allowed_rooms_sender = allowed_rooms.clone();
     let _send_handle = spawn_task("matrix_send", async move {
         matrix_send_loop(
-            client_sender,
+            bot_sender,
             rx,
             db_sender,
             mailing_list_sender,
             limits_sender,
-            allowed_rooms_sender,
         )
         .await;
     });
@@ -402,11 +289,10 @@ async fn main() -> Result<()> {
     });
 
     let db_retry = db.clone();
-    let client_retry = client.clone();
+    let bot_retry = bot.clone();
     let limits_retry = limits_config.clone();
-    let allowed_rooms_retry = allowed_rooms.clone();
     let _retry_handle = spawn_task("email_retry", async move {
-        retry_loop(client_retry, db_retry, limits_retry, allowed_rooms_retry).await;
+        retry_loop(bot_retry, db_retry, limits_retry).await;
     });
 
     let _smtp_retry_handle =
@@ -428,7 +314,7 @@ async fn main() -> Result<()> {
             "Spawning mailing-list confirmation monitor"
         );
         let db_confirmation = db.clone();
-        let client_confirmation = client.clone();
+        let client_confirmation = bot.client.clone();
         Some(spawn_task("delivery_confirmation", async move {
             delivery_confirmation_loop(client_confirmation, db_confirmation, timeout_secs).await;
         }))
@@ -445,17 +331,7 @@ async fn main() -> Result<()> {
     });
 
     info!("All background tasks spawned — entering Matrix continuous sync loop");
-    let sync_filter = FilterDefinition::with_lazy_loading();
-    loop {
-        match client
-            .sync(SyncSettings::default().filter(sync_filter.clone().into()))
-            .await
-        {
-            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
-            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
-        }
-        sleep(Duration::from_secs(5)).await;
-    }
+    bot.sync_forever().await
 }
 
 fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::path::Path) {
@@ -519,12 +395,11 @@ fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::
 }
 
 async fn matrix_send_loop(
-    client: Client,
+    bot: Bot,
     mut rx: mpsc::Receiver<RawEmail>,
     db: Db,
     mailing_list_config: config::MailingListConfig,
     limits: config::LimitsConfig,
-    allowed_rooms: config::RoomAllowList,
 ) {
     info!("Matrix send loop: ready, waiting for emails");
     while let Some(raw) = rx.recv().await {
@@ -636,9 +511,7 @@ async fn matrix_send_loop(
                 );
 
                 let t_post = std::time::Instant::now();
-                if let Err(e) =
-                    matrix_post::post_email(&client, &parsed, &db, &limits, &allowed_rooms).await
-                {
+                if let Err(e) = matrix_post::post_email(&bot, &parsed, &db, &limits).await {
                     warn!(
                         uid = uid,
                         message_id = %parsed.message_id,
@@ -682,12 +555,7 @@ async fn matrix_send_loop(
     warn!("Matrix send loop: channel closed — IMAP sync task may have exited");
 }
 
-async fn retry_loop(
-    client: Client,
-    db: Db,
-    limits: config::LimitsConfig,
-    allowed_rooms: config::RoomAllowList,
-) {
+async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
     info!("Email retry loop: started (poll interval: 300s)");
     loop {
         sleep(Duration::from_secs(300)).await;
@@ -737,9 +605,7 @@ async fn retry_loop(
                         "Email retry loop: retrying post"
                     );
                     let t = std::time::Instant::now();
-                    match matrix_post::post_email(&client, &parsed, &db, &limits, &allowed_rooms)
-                        .await
-                    {
+                    match matrix_post::post_email(&bot, &parsed, &db, &limits).await {
                         Ok(()) => {
                             info!(
                                 retry_id = id,

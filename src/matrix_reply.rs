@@ -1,15 +1,19 @@
 use std::collections::HashSet;
 
-use matrix_sdk::{
-    ruma::{
-        events::room::message::{MessageType, OriginalSyncRoomMessageEvent, Relation},
-        OwnedUserId,
+use mxbot_common::{
+    config::RoomAllowList,
+    matrix_sdk::{
+        self,
+        ruma::{
+            events::room::message::{MessageType, OriginalSyncRoomMessageEvent, Relation},
+            OwnedUserId,
+        },
+        Room, RoomState,
     },
-    Room, RoomState,
 };
 use tracing::{debug, info, warn};
 
-use crate::config::{RoomAllowList, SmtpConfig};
+use crate::config::SmtpConfig;
 use crate::db::Db;
 use crate::smtp_send::{send_reply, SmtpReply};
 
@@ -26,21 +30,12 @@ pub struct ReplyState {
     pub allowed_rooms: RoomAllowList,
 }
 
-pub fn register_reply_handler(client: &matrix_sdk::Client, state: ReplyState) {
-    debug!("Registering Matrix reply→email event handler");
-    client.add_event_handler({
-        let state = state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-            let state = state.clone();
-            async move {
-                handle_possible_reply(state, room, ev).await;
-            }
-        }
-    });
-    info!("Matrix reply→email event handler registered");
-}
-
-async fn handle_possible_reply(state: ReplyState, room: Room, ev: OriginalSyncRoomMessageEvent) {
+/// Bridge a room message to email if it is an authorized reply.
+pub async fn handle_possible_reply(
+    state: ReplyState,
+    room: Room,
+    ev: OriginalSyncRoomMessageEvent,
+) {
     let event_id = ev.event_id.to_string();
     let sender = ev.sender.to_string();
 
