@@ -13,8 +13,7 @@ use mxbot_common::{
     },
     Bot,
 };
-use serde_json;
-use tokio::{fs, signal, sync::mpsc, time::sleep};
+use tokio::{fs, sync::mpsc, time::sleep};
 use tracing::{debug, error, info, warn};
 
 mod config;
@@ -323,15 +322,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    tokio::spawn(async move {
-        if signal::ctrl_c().await.is_ok() {
-            info!("Received SIGINT — shutting down");
-            std::process::exit(0);
-        }
-    });
-
     info!("All background tasks spawned — entering Matrix continuous sync loop");
-    bot.sync_forever().await
+    bot.run().await
 }
 
 fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::path::Path) {

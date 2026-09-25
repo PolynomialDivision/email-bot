@@ -302,36 +302,31 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
     let mut attachments = Vec::new();
 
     let mut i = 0usize;
-    loop {
-        match msg.attachment(i as u32) {
-            Some(att) => {
-                i += 1;
-                let filename = att.attachment_name().unwrap_or("attachment").to_owned();
-                let content_type = if let Some(ct) = att.content_type() {
-                    let subtype = ct.c_subtype.as_deref().unwrap_or("octet-stream");
-                    format!("{}/{}", ct.c_type, subtype)
-                } else {
-                    "application/octet-stream".to_owned()
-                };
-                let data = att.contents();
-                if data.len() > max_attach {
-                    warn!(
-                        "Skipping attachment '{}' of uid={}: {} bytes exceeds limit {}",
-                        filename,
-                        raw.uid,
-                        data.len(),
-                        max_attach
-                    );
-                    continue;
-                }
-                attachments.push(Attachment {
-                    filename,
-                    content_type,
-                    data: data.to_vec(),
-                });
-            }
-            None => break,
+    while let Some(att) = msg.attachment(i as u32) {
+        i += 1;
+        let filename = att.attachment_name().unwrap_or("attachment").to_owned();
+        let content_type = if let Some(ct) = att.content_type() {
+            let subtype = ct.c_subtype.as_deref().unwrap_or("octet-stream");
+            format!("{}/{}", ct.c_type, subtype)
+        } else {
+            "application/octet-stream".to_owned()
+        };
+        let data = att.contents();
+        if data.len() > max_attach {
+            warn!(
+                "Skipping attachment '{}' of uid={}: {} bytes exceeds limit {}",
+                filename,
+                raw.uid,
+                data.len(),
+                max_attach
+            );
+            continue;
         }
+        attachments.push(Attachment {
+            filename,
+            content_type,
+            data: data.to_vec(),
+        });
     }
 
     debug!(

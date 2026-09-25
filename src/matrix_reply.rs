@@ -17,8 +17,6 @@ use crate::config::SmtpConfig;
 use crate::db::Db;
 use crate::smtp_send::{send_reply, SmtpReply};
 
-use serde_json;
-
 #[derive(Clone)]
 pub struct ReplyState {
     pub bot_user_id: OwnedUserId,
@@ -331,6 +329,7 @@ async fn handle_new_thread_message(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_matrix_email(
     state: &ReplyState,
     event_id: &str,
@@ -387,7 +386,7 @@ async fn send_matrix_email(
 
     // Step 2: attempt SMTP delivery.
     let t = std::time::Instant::now();
-    match send_reply(&state.smtp_config, &state.smtp_password, &smtp_reply).await {
+    match send_reply(&state.smtp_config, &state.smtp_password, smtp_reply).await {
         Ok(()) => {
             info!(
                 event_id = event_id,
@@ -453,7 +452,7 @@ async fn resolve_in_reply_to(
     if let Some(ref irt) = thread.in_reply_to {
         let irt_event_id = irt.event_id.to_string();
         // Don't double-look-up if m.in_reply_to points at the thread root itself.
-        if irt_event_id != thread.event_id.to_string() {
+        if irt_event_id != thread.event_id {
             match db.get_route_by_matrix_event(&irt_event_id).await {
                 Ok(Some(r)) if r.origin == "email" || r.origin == "matrix" => {
                     let email_id = r.email_message_id.clone();
