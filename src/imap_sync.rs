@@ -46,7 +46,7 @@ pub async fn imap_loop(
                     reconnect_delay_secs = reconnect_delay.as_secs(),
                     error = %e,
                     error_chain = ?e,
-                    "IMAP: connection/sync failed — will reconnect in {}s", reconnect_delay.as_secs()
+                    "IMAP: connection/sync failed, will reconnect in {}s", reconnect_delay.as_secs()
                 );
                 sleep(reconnect_delay).await;
                 reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(300));
@@ -75,7 +75,7 @@ async fn connect_and_sync(
         "IMAP: TCP connection established"
     );
 
-    // TLS handshake — IMAPS uses implicit TLS (no STARTTLS negotiation)
+    // TLS handshake: IMAPS uses implicit TLS (no STARTTLS negotiation)
     debug!(
         host = %config.host,
         tls_mode = "IMAPS (implicit TLS)",
@@ -90,7 +90,7 @@ async fn connect_and_sync(
         .await
         .with_context(|| {
             format!(
-                "IMAP TLS handshake failed with {} — check server certificate and hostname",
+                "IMAP TLS handshake failed with {}: check server certificate and hostname",
                 config.host
             )
         })?;
@@ -114,7 +114,7 @@ async fn connect_and_sync(
         .await
         .map_err(|(e, _)| {
             anyhow::anyhow!(
-                "IMAP LOGIN failed for user '{}' on {}: {} — check IMAP username and IMAP_PASSWORD",
+                "IMAP LOGIN failed for user '{}' on {}: {}, check IMAP username and IMAP_PASSWORD",
                 config.username,
                 config.host,
                 e
@@ -145,7 +145,7 @@ async fn connect_and_sync(
             poll = poll_count,
             mailbox = %mailbox,
             elapsed_ms = t_poll.elapsed().as_millis(),
-            "IMAP: poll cycle complete — sleeping {}s", poll_secs
+            "IMAP: poll cycle complete, sleeping {}s", poll_secs
         );
         sleep(Duration::from_secs(poll_secs)).await;
     }
@@ -184,7 +184,7 @@ async fn sync_once(
         if config.effective_skip_initial_history() {
             info!(
                 mailbox = %mailbox,
-                "IMAP: first run, skip_initial_history=true — marking all existing messages as seen without fetching"
+                "IMAP: first run, skip_initial_history=true, marking all existing messages as seen without fetching"
             );
             let t = Instant::now();
             let all_uids = fetch_all_uids(session).await?;
@@ -207,7 +207,7 @@ async fn sync_once(
                     mailbox = %mailbox,
                     uid_count = all_uids.len(),
                     max_uid = max_uid,
-                    "IMAP: initial skip complete — marked all existing messages as seen"
+                    "IMAP: initial skip complete, marked all existing messages as seen"
                 );
             } else {
                 info!(mailbox = %mailbox, "IMAP: mailbox empty on first run");
@@ -218,7 +218,7 @@ async fn sync_once(
             info!(
                 mailbox = %mailbox,
                 fetch_limit = limit,
-                "IMAP: first run, skip_initial_history=false — fetching last {} messages", limit
+                "IMAP: first run, skip_initial_history=false, fetching last {} messages", limit
             );
             let t = Instant::now();
             let all_uids = fetch_all_uids(session).await?;
@@ -270,7 +270,7 @@ async fn sync_once(
 
     for uid in sorted_uids {
         if db.uid_seen(mailbox, uid).await.unwrap_or(false) {
-            debug!(uid = uid, mailbox = %mailbox, "IMAP: UID already seen — skipping");
+            debug!(uid = uid, mailbox = %mailbox, "IMAP: UID already seen, skipping");
             continue;
         }
 
@@ -284,7 +284,7 @@ async fn sync_once(
                     mailbox = %mailbox,
                     bytes = byte_count,
                     elapsed_ms = t_fetch.elapsed().as_millis(),
-                    "IMAP: message fetched — queuing for processing"
+                    "IMAP: message fetched, queuing for processing"
                 );
                 let raw = RawEmail {
                     uid,
@@ -296,7 +296,7 @@ async fn sync_once(
                     warn!(
                         uid = uid,
                         mailbox = %mailbox,
-                        "IMAP: processing channel closed — matrix_send task may have exited"
+                        "IMAP: processing channel closed, matrix_send task may have exited"
                     );
                     return Ok(());
                 }
@@ -322,7 +322,7 @@ async fn sync_once(
                     mailbox = %mailbox,
                     error = %e,
                     error_chain = ?e,
-                    "IMAP: failed to fetch message body — skipping UID"
+                    "IMAP: failed to fetch message body, skipping UID"
                 );
                 // Continue with next UID rather than aborting the whole sync.
             }

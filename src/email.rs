@@ -58,7 +58,7 @@ pub struct ParsedEmail {
     pub body_html: Option<String>,
     pub attachments: Vec<Attachment>,
     pub thread_root: Option<String>,
-    /// Set to "matrix" for emails sent by this bridge — used for loop prevention.
+    /// Set to "matrix" for emails sent by this bridge: used for loop prevention.
     #[serde(default)]
     pub bridge_origin: Option<String>,
     /// Stable correlation identifier added to Matrix-originated emails.
@@ -234,7 +234,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
     let message_id = clean_message_id(msg.message_id().unwrap_or(""));
     let message_id = if message_id.is_empty() {
         let generated = format!("uid-{}", raw.uid);
-        warn!(uid = raw.uid, mailbox = %raw.mailbox, generated_id = %generated, "MIME: no Message-Id header — using generated ID");
+        warn!(uid = raw.uid, mailbox = %raw.mailbox, generated_id = %generated, "MIME: no Message-Id header, using generated ID");
         generated
     } else {
         message_id
@@ -444,7 +444,7 @@ pub async fn reconstruct_thread(parsed: &mut ParsedEmail, db: &Db) {
         }
     }
 
-    debug!(message_id = %parsed.message_id, "thread_reconstruct: no thread root found — will become new thread root");
+    debug!(message_id = %parsed.message_id, "thread_reconstruct: no thread root found, will become new thread root");
     parsed.thread_root = None;
 }
 

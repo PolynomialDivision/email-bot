@@ -19,7 +19,7 @@ pub fn format_email(email: &ParsedEmail, limits: &LimitsConfig) -> (String, Stri
     // Build plain text
     let prefix = if is_reply { "↩️ Re: " } else { "📧 " };
     let plain = format!(
-        "{}{}\nFrom: {} · {}\n\n{}",
+        "{}{}\n👤 {}\n🕒 {}\n\n{}",
         prefix, subject, sender, date_str, body_collapsed
     );
 
@@ -32,12 +32,12 @@ pub fn format_email(email: &ParsedEmail, limits: &LimitsConfig) -> (String, Stri
 
     let header_html = if is_reply {
         format!(
-            "↩️ <strong>Re: {}</strong><br>\n<em>{}</em> · <em>{}</em><br><br>\n",
+            "↩️ <strong>Re: {}</strong><br>\n👤 <em>{}</em><br>\n🕒 <em>{}</em><br><br>\n",
             subject_escaped, sender_escaped, date_escaped
         )
     } else {
         format!(
-            "📧 <strong>{}</strong><br>\n<em>{}</em> · <em>{}</em><br><br>\n",
+            "📧 <strong>{}</strong><br>\n👤 <em>{}</em><br>\n🕒 <em>{}</em><br><br>\n",
             subject_escaped, sender_escaped, date_escaped
         )
     };
@@ -64,7 +64,7 @@ pub fn format_date(date: Option<&DateTime<Utc>>) -> String {
 }
 
 /// Collapse `>` prefixed quote blocks to at most max_lines lines, appending
-/// "[... N more lines quoted]" if truncated.
+/// "💬 [N more lines quoted]" if truncated.
 pub fn collapse_quotes(text: &str, max_lines: usize) -> String {
     let mut result = Vec::new();
     let mut quote_block: Vec<&str> = Vec::new();
@@ -79,7 +79,7 @@ pub fn collapse_quotes(text: &str, max_lines: usize) -> String {
             result.push((*line).to_owned());
         }
         if total > shown {
-            result.push(format!("[... {} more lines quoted]", total - shown));
+            result.push(format!("💬 [{} more lines quoted]", total - shown));
         }
         block.clear();
     };
@@ -195,7 +195,7 @@ fn plain_to_html(text: &str, max_quote: usize) -> String {
         }
         if total > shown {
             out.push_str(&format!(
-                "<em>[... {} more lines quoted]</em><br>\n",
+                "<em>💬 {} more lines quoted</em><br>\n",
                 total - shown
             ));
         }

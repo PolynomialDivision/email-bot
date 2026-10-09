@@ -48,7 +48,7 @@ fn install_panic_hook() {
         tracing::error!(
             panic.location = %location,
             panic.message = %message,
-            "PANIC: task crashed — set RUST_BACKTRACE=1 for stack trace"
+            "PANIC: task crashed. Set RUST_BACKTRACE=1 for stack trace"
         );
     }));
 }
@@ -63,7 +63,7 @@ where
         // Background tasks are expected to loop forever; reaching here is abnormal.
         warn!(
             task = name,
-            "Task exited — this task should run indefinitely"
+            "Task exited. This task should run indefinitely"
         );
     })
 }
@@ -72,9 +72,9 @@ where
 async fn main() -> Result<()> {
     // Env-filter subscriber: RUST_LOG controls verbosity.
     // Examples:
-    //   RUST_LOG=info                          — default, recommended for production
-    //   RUST_LOG=debug                         — verbose, includes all internal state
-    //   RUST_LOG=email_bot=debug,warn          — debug this crate, quiet external crates
+    //   RUST_LOG=info: default, recommended for production
+    //   RUST_LOG=debug: verbose, includes all internal state
+    //   RUST_LOG=email_bot=debug,warn: debug this crate, quiet external crates
     //   RUST_LOG=email_bot=debug,matrix_sdk=info,warn
     // RUST_LOG overrides the default (email_bot=info, SDK at warn), e.g.
     //   RUST_LOG=email_bot=debug,warn
@@ -85,9 +85,9 @@ async fn main() -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "email-bot starting");
     info!(
         "Runtime debugging:\n  \
-         RUST_LOG=debug                  — verbose output from all crates\n  \
-         RUST_LOG=email_bot=debug,warn   — debug this bot, quiet external crates\n  \
-         RUST_BACKTRACE=1               — print stack traces on panic"
+         RUST_LOG=debug: verbose output from all crates\n  \
+         RUST_LOG=email_bot=debug,warn: debug this bot, quiet external crates\n  \
+         RUST_BACKTRACE=1: print stack traces on panic"
     );
 
     let config_path = mxbot_common::config::config_path_from_args();
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
         .context("Invalid allowed_repliers in [security] config")?;
     info!(strategy = ?config.security.common.encryption_strategy, "Encryption strategy configured");
     if config.security.common.allowed_rooms.is_none() {
-        warn!("allowed_rooms = [] — bot will not operate in any room");
+        warn!("allowed_rooms = [], bot will not operate in any room");
     }
 
     info!(
@@ -181,14 +181,14 @@ async fn main() -> Result<()> {
             }
             None => {
                 warn!(
-                    "[smtp] section is present in config but SMTP_PASSWORD env var is not set \
-                     — Matrix→Email reply bridging is DISABLED. \
+                    "[smtp] section is present in config but SMTP_PASSWORD env var is not set, \
+                     so Matrix→Email reply bridging is DISABLED. \
                      Set SMTP_PASSWORD to enable it."
                 );
             }
         }
     } else {
-        info!("No [smtp] section in config — Matrix→Email reply bridging disabled");
+        info!("No [smtp] section in config, Matrix→Email reply bridging disabled");
     }
 
     // Room messages: admin console first; everything else outside admin
@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
         }
         if rooms.is_empty() {
             warn!(
-                "Bot is not in any rooms — emails will be fetched but cannot be posted. \
+                "Bot is not in any rooms: emails will be fetched but cannot be posted. \
                  Invite the bot to a Matrix room."
             );
         }
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
                     warn!(
                         room_id = %room.room_id(),
                         name = ?room.name(),
-                        "Bot is joined to a room not in allowed_rooms — consider leaving it"
+                        "Bot is joined to a room not in allowed_rooms: consider leaving it"
                     );
                 }
             }
@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    info!("All background tasks spawned — entering Matrix continuous sync loop");
+    info!("All background tasks spawned, entering Matrix continuous sync loop");
     bot.run().await
 }
 
@@ -366,7 +366,7 @@ fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::
                 "SMTP"
             );
         }
-        None => info!("SMTP: not configured — Matrix→Email bridging disabled"),
+        None => info!("SMTP: not configured, Matrix→Email bridging disabled"),
     }
     let list_cfg = &config.mailing_list;
     info!(
@@ -401,7 +401,7 @@ async fn matrix_send_loop(
 
         match email::parse(&raw, &limits) {
             Err(e) => {
-                warn!(uid = uid, mailbox = %mailbox, error = %e, "Failed to parse email — skipping");
+                warn!(uid = uid, mailbox = %mailbox, error = %e, "Failed to parse email, skipping");
                 continue;
             }
             Ok(mut parsed) => {
@@ -474,7 +474,7 @@ async fn matrix_send_loop(
                             uid = uid,
                             message_id = %parsed.message_id,
                             error = %e,
-                            "DB error on bridge-echo check — proceeding to avoid lost content"
+                            "DB error on bridge-echo check: proceeding to avoid lost content"
                         );
                     }
                     Ok(false) => {
@@ -509,7 +509,7 @@ async fn matrix_send_loop(
                         message_id = %parsed.message_id,
                         error = %e,
                         error_chain = ?e,
-                        "Failed to post email to Matrix — adding to retry queue"
+                        "Failed to post email to Matrix: adding to retry queue"
                     );
                     match serde_json::to_string(&parsed) {
                         Ok(payload) => {
@@ -518,7 +518,7 @@ async fn matrix_send_loop(
                                     uid = uid,
                                     message_id = %parsed.message_id,
                                     error = %db_err,
-                                    "Failed to push to retry queue — email may be lost"
+                                    "Failed to push to retry queue: email may be lost"
                                 );
                             } else {
                                 debug!(uid = uid, message_id = %parsed.message_id, "Email added to retry queue");
@@ -529,7 +529,7 @@ async fn matrix_send_loop(
                                 uid = uid,
                                 message_id = %parsed.message_id,
                                 error = %e,
-                                "Failed to serialize email for retry — email lost"
+                                "Failed to serialize email for retry: email lost"
                             );
                         }
                     }
@@ -544,7 +544,7 @@ async fn matrix_send_loop(
             }
         }
     }
-    warn!("Matrix send loop: channel closed — IMAP sync task may have exited");
+    warn!("Matrix send loop: channel closed, IMAP sync task may have exited");
 }
 
 async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
@@ -571,7 +571,7 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
                             error!(
                                 retry_id = id,
                                 error = %e,
-                                "Email retry loop: corrupt payload — discarding"
+                                "Email retry loop: corrupt payload, discarding"
                             );
                             db.ack_retry(id).await.ok();
                             continue;
@@ -583,7 +583,7 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
                             retry_id = id,
                             message_id = %parsed.message_id,
                             attempts = attempts,
-                            "Email retry loop: max attempts reached — dropping"
+                            "Email retry loop: max attempts reached, dropping"
                         );
                         db.ack_retry(id).await.ok();
                         continue;
@@ -620,7 +620,7 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
                                 backoff_secs = backoff_secs,
                                 error = %e,
                                 error_chain = ?e,
-                                "Email retry loop: retry failed — backoff {}s", backoff_secs
+                                "Email retry loop: retry failed, backoff {}s", backoff_secs
                             );
                             db.fail_retry(id, next_retry_at).await.ok();
                         }
@@ -668,7 +668,7 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
                     error!(
                         matrix_event_id = %item.matrix_event_id,
                         error = %e,
-                        "SMTP retry loop: corrupt payload — parking with max retry_at to stop blocking queue"
+                        "SMTP retry loop: corrupt payload, parking with max retry_at to stop blocking queue"
                     );
                     db.mark_route_failed(&item.matrix_event_id, i64::MAX)
                         .await
@@ -712,7 +712,7 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
                         elapsed_ms = t.elapsed().as_millis(),
                         error = %e,
                         error_chain = ?e,
-                        "SMTP retry loop: delivery failed — backoff {}s", backoff_secs
+                        "SMTP retry loop: delivery failed, backoff {}s", backoff_secs
                     );
                     db.mark_route_failed(&item.matrix_event_id, next_retry_at)
                         .await
@@ -724,7 +724,7 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
         // Sleep until the next scheduled retry, up to a 5-minute cap.
         let sleep_dur = match db.get_next_smtp_retry_at().await {
             Ok(None) => {
-                debug!("SMTP retry loop: nothing queued — sleeping 300s");
+                debug!("SMTP retry loop: nothing queued, sleeping 300s");
                 Duration::from_secs(300)
             }
             Ok(Some(ts)) => {
@@ -738,7 +738,7 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
                 Duration::from_secs(secs)
             }
             Err(e) => {
-                error!(error = %e, "SMTP retry loop: failed to query next retry time — sleeping 300s");
+                error!(error = %e, "SMTP retry loop: failed to query next retry time, sleeping 300s");
                 Duration::from_secs(300)
             }
         };
@@ -758,14 +758,14 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                     matrix_event_id = %notice.matrix_event_id,
                     room_id = %notice.room_id,
                     timeout_secs = timeout_secs,
-                    "Mailing-list delivery remains unconfirmed — notice claimed"
+                    "Mailing-list delivery remains unconfirmed: notice claimed"
                 );
 
                 match db.delivery_notice_is_active(&notice.matrix_event_id).await {
                     Ok(false) => {
                         info!(
                             matrix_event_id = %notice.matrix_event_id,
-                            "Delivery was confirmed after notice scheduling — suppressing notice"
+                            "Delivery was confirmed after notice scheduling: suppressing notice"
                         );
                         continue;
                     }
@@ -773,7 +773,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                         warn!(
                             matrix_event_id = %notice.matrix_event_id,
                             error = %e,
-                            "Could not re-check delivery state — releasing notice claim"
+                            "Could not re-check delivery state: releasing notice claim"
                         );
                         db.release_delivery_notice(&notice.matrix_event_id)
                             .await
@@ -791,7 +791,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                             matrix_event_id = %notice.matrix_event_id,
                             room_id = %notice.room_id,
                             error = %e,
-                            "Invalid room ID for delivery notice — parking notice"
+                            "Invalid room ID for delivery notice: parking notice"
                         );
                         db.mark_delivery_notice_sent(&notice.matrix_event_id)
                             .await
@@ -803,7 +803,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                     warn!(
                         matrix_event_id = %notice.matrix_event_id,
                         room_id = %room_id,
-                        "Room unavailable for delivery notice — releasing claim"
+                        "Room unavailable for delivery notice: releasing claim"
                     );
                     db.release_delivery_notice(&notice.matrix_event_id)
                         .await
@@ -814,7 +814,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
 
                 let minutes = timeout_secs.div_ceil(60);
                 let content = RoomMessageEventContent::text_plain(format!(
-                    "Email delivery unconfirmed for Matrix event {}. The SMTP relay accepted the message, but no mailing-list copy was received within {} minutes. No automatic resend was attempted.",
+                    "⚠️ Email delivery unconfirmed\n\n📤 The mail server accepted the message for event {}.\n📭 But no copy came back from the mailing list within {} minutes.\n🔁 I did not resend it.",
                     notice.matrix_event_id, minutes
                 ));
                 let transaction_id = OwnedTransactionId::from(format!(
@@ -842,7 +842,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                             matrix_event_id = %notice.matrix_event_id,
                             room_id = %room_id,
                             error = %e,
-                            "Failed to post delivery-unconfirmed notice — releasing claim"
+                            "Failed to post delivery-unconfirmed notice: releasing claim"
                         );
                         db.release_delivery_notice(&notice.matrix_event_id)
                             .await

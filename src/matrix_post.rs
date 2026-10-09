@@ -59,7 +59,7 @@ pub async fn post_email(
                     root_email_message_id = %root_msg_id,
                     root_event_id = %root_event_id_str,
                     thread_root_id = %thread_root_id,
-                    "matrix_post: thread root found — posting as thread reply"
+                    "matrix_post: thread root found, posting as thread reply"
                 );
                 Some((root_event_id_str, thread_root_id))
             }
@@ -67,13 +67,13 @@ pub async fn post_email(
                 warn!(
                     message_id = %email.message_id,
                     root_email_message_id = %root_msg_id,
-                    "matrix_post: thread root not in DB — posting as new thread root"
+                    "matrix_post: thread root not in DB, posting as new thread root"
                 );
                 None
             }
         }
     } else {
-        debug!(message_id = %email.message_id, "matrix_post: no thread root — new thread");
+        debug!(message_id = %email.message_id, "matrix_post: no thread root, new thread");
         None
     };
 
@@ -95,7 +95,7 @@ pub async fn post_email(
                     message_id = %email.message_id,
                     root_event_id = %root_event_id_str,
                     error = %e,
-                    "matrix_post: invalid root event ID — posting without thread relation"
+                    "matrix_post: invalid root event ID, posting without thread relation"
                 );
             }
         }
@@ -110,7 +110,7 @@ pub async fn post_email(
     if rooms.is_empty() {
         warn!(
             message_id = %email.message_id,
-            "matrix_post: no joined rooms — email cannot be posted (check bot invite)"
+            "matrix_post: no joined rooms, email cannot be posted (check bot invite)"
         );
         return Ok(());
     }
@@ -227,7 +227,7 @@ async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig)
                 filename = %attachment.filename,
                 bytes = attachment.data.len(),
                 max_bytes = max_bytes,
-                "matrix_post: skipping attachment — exceeds size limit"
+                "matrix_post: skipping attachment, exceeds size limit"
             );
             continue;
         }

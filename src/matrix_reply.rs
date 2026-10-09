@@ -79,7 +79,7 @@ pub async fn handle_possible_reply(
         warn!(
             event_id = %event_id,
             sender = %sender,
-            "Skip: sender not in allowed_repliers — unauthorized bridge attempt"
+            "Skip: sender not in allowed_repliers, unauthorized bridge attempt"
         );
         return;
     }
@@ -98,7 +98,7 @@ pub async fn handle_possible_reply(
             warn!(
                 event_id = %event_id,
                 error = %e,
-                "DB error on dedup check — skipping to avoid double-send"
+                "DB error on dedup check: skipping to avoid double-send"
             );
             return;
         }
@@ -162,7 +162,7 @@ async fn handle_thread_reply(
                 email_message_id = %r.email_message_id,
                 subject = ?r.subject,
                 origin = %r.origin,
-                "Thread root found — proceeding"
+                "Thread root found: proceeding"
             );
             r
         }
@@ -309,7 +309,7 @@ async fn handle_new_thread_message(
             event_id = event_id,
             our_message_id = %smtp_reply.our_message_id,
             error = %e,
-            "Failed to store Matrix-originated thread mapping — aborting"
+            "Failed to store Matrix-originated thread mapping: aborting"
         );
         return;
     }
@@ -368,7 +368,7 @@ async fn send_matrix_email(
         )
         .await
     {
-        warn!(event_id = event_id, error = %e, "Failed to insert PENDING route — aborting");
+        warn!(event_id = event_id, error = %e, "Failed to insert PENDING route, aborting");
         return;
     }
     debug!(event_id = event_id, "Route state: PENDING");
@@ -392,7 +392,7 @@ async fn send_matrix_email(
                 event_id = event_id,
                 our_message_id = %smtp_reply.our_message_id,
                 elapsed_ms = t.elapsed().as_millis(),
-                "SMTP accepted message — awaiting optional list confirmation"
+                "SMTP accepted message: awaiting optional list confirmation"
             );
             if let Err(e) = state.db.mark_route_smtp_accepted(event_id).await {
                 warn!(event_id = event_id, error = %e, "Failed to mark route SMTP_ACCEPTED (will retry as PENDING)");
@@ -409,7 +409,7 @@ async fn send_matrix_email(
                 error = %e,
                 error_chain = ?e,
                 next_retry_in_secs = 60,
-                "SMTP delivery failed — marking route FAILED, retry in 60s"
+                "SMTP delivery failed: marking route FAILED, retry in 60s"
             );
             if let Err(db_err) = state.db.mark_route_failed(event_id, next_retry_at).await {
                 warn!(event_id = event_id, error = %db_err, "Failed to mark route FAILED");

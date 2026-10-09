@@ -4,7 +4,7 @@ set -euo pipefail
 STORE="${STORE_PATH:-store}"
 
 if [ ! -d "$STORE" ]; then
-    echo "Store directory '$STORE' not found — nothing to do."
+    echo "Store directory '$STORE' not found. Nothing to do."
     exit 0
 fi
 
@@ -24,4 +24,4 @@ rm -f \
     "$STORE"/matrix-sdk-media.sqlite3-shm \
     "$STORE"/matrix-sdk-media.sqlite3-wal
 
-echo "Done. Restart the bot — it will re-initialize E2EE and re-join rooms."
+echo "Done. Restart the bot. It will re-initialize E2EE and re-join rooms."

@@ -635,7 +635,7 @@ impl Db {
     }
 
     /// Return the earliest next_retry_at across all retriable routes (attempts < 10).
-    /// NULL next_retry_at (pending, never attempted) is coalesced to 0 — treated as
+    /// NULL next_retry_at (pending, never attempted) is coalesced to 0: treated as
     /// immediately due. Returns None when there are no eligible routes at all.
     pub async fn get_next_smtp_retry_at(&self) -> Result<Option<i64>> {
         let conn = Arc::clone(&self.conn);

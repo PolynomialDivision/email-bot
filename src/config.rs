@@ -102,7 +102,7 @@ pub struct SmtpConfig {
     // password loaded from SMTP_PASSWORD env var at runtime
     /// Address used in the From header of bridge-sent emails.
     pub from_address: String,
-    /// The mailing list posting address — used as To and Reply-To.
+    /// The mailing list posting address: used as To and Reply-To.
     pub list_address: String,
     /// true = implicit TLS / SMTPS (port 465).
     /// false (default) = STARTTLS (port 587).
@@ -124,7 +124,7 @@ fn default_smtp_port() -> u16 {
 
 pub struct Secrets {
     pub imap_password: String,
-    /// Optional — only required when [smtp] is configured.
+    /// Optional: only required when [smtp] is configured.
     pub smtp_password: Option<String>,
 }
 

@@ -123,12 +123,12 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
             config.host, config.port, tls_mode
         )
     })?;
-    debug!("SMTP: transport built — connecting and sending");
+    debug!("SMTP: transport built, connecting and sending");
 
     let t = std::time::Instant::now();
     let response = transport.send(message).await.with_context(|| {
         format!(
-            "SMTP send failed for <{}> via {}:{} ({}) — check credentials and server reachability",
+            "SMTP send failed for <{}> via {}:{} ({}): check credentials and server reachability",
             reply.our_message_id, config.host, config.port, tls_mode
         )
     })?;
@@ -149,7 +149,7 @@ pub async fn send_reply(config: &SmtpConfig, password: &str, reply: &SmtpReply) 
 
 fn build_email(config: &SmtpConfig, reply: &SmtpReply) -> Result<Message> {
     // From display name: "Alice (Matrix: @alice:example.org)"
-    // DMARC is unaffected — the domain inside <addr> stays as our own sending domain.
+    // DMARC is unaffected. The domain inside <addr> stays as our own sending domain.
     // Mailing lists that munge From for DMARC compliance only care about the <addr> domain.
     let name = sanitize_header_value(&reply.display_name);
     let matrix_id: String = reply
