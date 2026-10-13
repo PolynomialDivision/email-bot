@@ -44,7 +44,7 @@ impl Db {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS seen_emails (
@@ -126,7 +126,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let mailbox = mailbox.to_owned();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM seen_emails WHERE uid = ?1 AND mailbox = ?2",
                 params![uid, mailbox],
@@ -149,7 +149,7 @@ impl Db {
         let message_id = message_id.map(str::to_owned);
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR IGNORE INTO seen_emails (uid, mailbox, message_id, processed_at) VALUES (?1, ?2, ?3, ?4)",
                 params![uid, mailbox, message_id, now],
@@ -164,7 +164,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let message_id = message_id.to_owned();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT matrix_event_id, thread_root_id FROM thread_map WHERE message_id = ?1",
             )?;
@@ -195,7 +195,7 @@ impl Db {
         let mailbox = mailbox.to_owned();
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR REPLACE INTO thread_map (message_id, matrix_event_id, thread_root_id, mailbox, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![message_id, matrix_event_id, thread_root_id, mailbox, now],
@@ -210,7 +210,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let key = format!("last_uid:{}", mailbox);
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let result = conn.query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 params![key],
@@ -231,7 +231,7 @@ impl Db {
         let key = format!("last_uid:{}", mailbox);
         let value = uid.to_string();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
                 params![key, value],
@@ -249,7 +249,7 @@ impl Db {
         // first retry after 60 seconds
         let next_retry_at = now + 60;
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT INTO retry_queue (payload, attempts, next_retry_at, created_at) VALUES (?1, 0, ?2, ?3)",
                 params![payload, next_retry_at, now],
@@ -264,7 +264,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT id, payload, attempts FROM retry_queue WHERE next_retry_at <= ?1 ORDER BY next_retry_at ASC LIMIT ?2",
             )?;
@@ -284,7 +284,7 @@ impl Db {
     pub async fn ack_retry(&self, id: i64) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute("DELETE FROM retry_queue WHERE id = ?1", params![id])?;
             Ok::<(), anyhow::Error>(())
         })
@@ -295,7 +295,7 @@ impl Db {
     pub async fn fail_retry(&self, id: i64, next_retry_at: i64) -> Result<()> {
         let conn = Arc::clone(&self.conn);
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "UPDATE retry_queue SET attempts = attempts + 1, next_retry_at = ?1 WHERE id = ?2",
                 params![next_retry_at, id],
@@ -322,7 +322,7 @@ impl Db {
         let origin = origin.to_owned();
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR REPLACE INTO message_routes \
                  (matrix_event_id, email_message_id, thread_root_email_message_id, subject, origin, created_at) \
@@ -342,7 +342,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let matrix_event_id = matrix_event_id.to_owned();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT email_message_id, thread_root_email_message_id, subject, origin \
                  FROM message_routes WHERE matrix_event_id = ?1",
@@ -385,7 +385,7 @@ impl Db {
         let smtp_payload = smtp_payload.to_owned();
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "INSERT OR IGNORE INTO message_routes \
                  (matrix_event_id, email_message_id, thread_root_email_message_id, \
@@ -412,7 +412,7 @@ impl Db {
         let matrix_event_id = matrix_event_id.to_owned();
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "UPDATE message_routes \
                  SET smtp_status = 'smtp_accepted', smtp_accepted_at = ?1, smtp_next_retry_at = NULL \
@@ -439,7 +439,7 @@ impl Db {
             .map(str::to_owned);
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let mut conn = conn.lock().unwrap();
+            let mut conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let matched = tx
                 .query_row(
@@ -486,7 +486,7 @@ impl Db {
         let cutoff = now - timeout_secs;
         let stale_claim = now - lease_secs;
         spawn_blocking(move || {
-            let mut conn = conn.lock().unwrap();
+            let mut conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let candidate = tx
                 .query_row(
@@ -533,7 +533,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let matrix_event_id = matrix_event_id.to_owned();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM message_routes \
                  WHERE matrix_event_id = ?1 AND smtp_status = 'delivery_unconfirmed' \
@@ -557,7 +557,7 @@ impl Db {
         let matrix_event_id = matrix_event_id.to_owned();
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             if sent {
                 conn.execute(
                     "UPDATE message_routes \
@@ -584,7 +584,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let matrix_event_id = matrix_event_id.to_owned();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
                 "UPDATE message_routes \
                  SET smtp_status = 'failed', \
@@ -606,7 +606,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let now = chrono::Utc::now().timestamp();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let mut stmt = conn.prepare(
                 "SELECT matrix_event_id, smtp_payload, smtp_attempts \
                  FROM message_routes \
@@ -640,7 +640,7 @@ impl Db {
     pub async fn get_next_smtp_retry_at(&self) -> Result<Option<i64>> {
         let conn = Arc::clone(&self.conn);
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let result = conn.query_row(
                 "SELECT MIN(COALESCE(smtp_next_retry_at, 0)) \
                  FROM message_routes \
@@ -662,7 +662,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let email_message_id = email_message_id.to_owned();
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM message_routes \
                  WHERE email_message_id = ?1 AND origin = 'matrix' \
@@ -680,7 +680,7 @@ impl Db {
         let conn = Arc::clone(&self.conn);
         let cutoff = chrono::Utc::now().timestamp() - older_than_secs;
         spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             let deleted = conn.execute(
                 "DELETE FROM thread_map WHERE created_at < ?1",
                 params![cutoff],
@@ -719,7 +719,7 @@ mod tests {
     }
 
     fn make_overdue(db: &Db, event_id: &str) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE message_routes SET smtp_accepted_at = ?1 WHERE matrix_event_id = ?2",
             rusqlite::params![chrono::Utc::now().timestamp() - 7200, event_id],
@@ -728,7 +728,7 @@ mod tests {
     }
 
     fn route_state(db: &Db, event_id: &str) -> (String, i64, String) {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT smtp_status, smtp_attempts, email_message_id \
              FROM message_routes WHERE matrix_event_id = ?1",
