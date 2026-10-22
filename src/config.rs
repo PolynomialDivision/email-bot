@@ -18,6 +18,23 @@ pub struct Config {
     pub smtp: Option<SmtpConfig>,
 }
 
+impl Config {
+    /// Values serde accepts but the bot cannot work with.
+    pub fn validate(&self) -> Result<()> {
+        if self.imap.poll_interval_secs == Some(0) {
+            anyhow::bail!("[imap] poll_interval_secs must be at least 1");
+        }
+        if self
+            .smtp
+            .as_ref()
+            .is_some_and(|smtp| smtp.list_confirmation_timeout_secs == Some(0))
+        {
+            anyhow::bail!("[smtp] list_confirmation_timeout_secs must be at least 1 (omit it to turn the notice off)");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ImapConfig {
     pub host: String,
@@ -149,4 +166,34 @@ pub fn parse_allowed_repliers(security: &SecurityConfig) -> Result<HashSet<Owned
         set.insert(uid);
     }
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// house-infra's rendered config (build/rendered/…/email-bot.config.toml; addresses,
+    /// room and user IDs replaced).
+    const HOUSE_INFRA: &str = include_str!("../tests/fixtures/house-infra.config.toml");
+
+    #[test]
+    fn house_infra_config_loads_and_validates() {
+        let config: Config = toml::from_str(HOUSE_INFRA).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.imap.effective_poll_interval_secs(), 60);
+        let smtp = config.smtp.as_ref().unwrap();
+        assert!(smtp.require_smtps && smtp.allow_new_threads_from_matrix);
+        assert_eq!(smtp.list_confirmation_timeout_secs, Some(3600));
+        assert_eq!(config.limits.effective_max_body_bytes(), 512 * 1024);
+        assert!(parse_allowed_repliers(&config.security).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_zero_poll_interval_is_refused() {
+        let config: Config = toml::from_str(
+            &HOUSE_INFRA.replace("poll_interval_secs = 60", "poll_interval_secs = 0"),
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
 }

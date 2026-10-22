@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
     let config_path = mxbot_common::config::config_path_from_args();
     info!(config_path = %config_path.display(), "Loading config");
     let config: Config = mxbot_common::config::load_toml(&config_path)?;
+    config.validate().context("Config validation failed")?;
     info!(config_path = %config_path.display(), "Config loaded successfully");
 
     let secrets = Secrets::from_env().context("Loading secrets from environment")?;
@@ -821,7 +822,8 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
                     "email-delivery-unconfirmed:{}",
                     notice.matrix_event_id
                 ));
-                match room.send(content).with_transaction_id(transaction_id).await {
+                match mxbot_common::send::send_with_retry_txn(&room, content, &transaction_id).await
+                {
                     Ok(_) => {
                         info!(
                             matrix_event_id = %notice.matrix_event_id,

@@ -218,6 +218,12 @@ fn extract_list_id(msg: &mail_parser::Message) -> Option<String> {
     None
 }
 
+/// At most `max_bytes` of `s`, cut at a character boundary (slicing a `str`
+/// inside a multi-byte character panics, and the panic ended the send loop).
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    &s[..s.floor_char_boundary(max_bytes)]
+}
+
 pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
     debug!(uid = raw.uid, mailbox = %raw.mailbox, bytes = raw.raw.len(), "MIME: parsing email");
 
@@ -278,12 +284,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
                 s.len(),
                 max_body
             );
-            let truncated = &s[..max_body];
-            // Truncate at last valid UTF-8 boundary
-            match std::str::from_utf8(truncated.as_bytes()) {
-                Ok(v) => format!("{}\n[truncated]", v),
-                Err(e) => format!("{}\n[truncated]", &truncated[..e.valid_up_to()]),
-            }
+            format!("{}\n[truncated]", truncate_utf8(s, max_body))
         } else {
             s.to_owned()
         }
@@ -292,7 +293,7 @@ pub fn parse(raw: &RawEmail, limits: &LimitsConfig) -> Result<ParsedEmail> {
     let body_html = msg.body_html(0).map(|b| {
         let s: &str = &b;
         if s.len() > max_body {
-            s[..max_body].to_owned()
+            truncate_utf8(s, max_body).to_owned()
         } else {
             s.to_owned()
         }
@@ -496,6 +497,29 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Body text here."));
+    }
+
+    #[test]
+    fn long_bodies_are_cut_at_a_character_boundary() {
+        // "ä" is two bytes: a cut after 5 bytes falls inside the third one.
+        let body = "äääää".repeat(4);
+        let raw_bytes = format!(
+            "From: test@example.com\r\nSubject: Umlaut\r\nMessage-ID: <cut@example.com>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}"
+        );
+        let raw = RawEmail {
+            uid: 3,
+            mailbox: "INBOX".to_owned(),
+            raw: raw_bytes.into_bytes(),
+        };
+        let limits = LimitsConfig {
+            max_body_bytes: Some(5),
+            ..make_limits()
+        };
+        let parsed = parse(&raw, &limits).unwrap();
+        assert_eq!(parsed.body_plain.as_deref(), Some("ää\n[truncated]"));
+        assert_eq!(truncate_utf8("äb", 1), "");
+        assert_eq!(truncate_utf8("äb", 3), "äb");
+        assert_eq!(truncate_utf8("äb", 99), "äb");
     }
 
     #[test]

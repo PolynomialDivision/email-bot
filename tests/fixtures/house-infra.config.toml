@@ -1,0 +1,56 @@
+# Rendered by Ansible from stacks/matrix-bots/secrets/email-bot.config.toml.j2. Do not edit on the host.
+[matrix]
+homeserver = "http://tuwunel:8008"
+user_id = "@email-bot:example.org"
+device_id = "HOUSEINFRAEMAILBOT"
+# access_token: MATRIX_ACCESS_TOKEN from session/matrix.env (roles/matrix_accounts).
+
+[security]
+admin_users = ["@nick:example.org", "@admin2:example.org"]
+allowed_inviters = ["@nick:example.org", "@admin2:example.org"]
+allowed_rooms = ["!room:example.org"]
+dm_rooms = ["!room:example.org"]
+encryption_strategy = "identity_based"
+# verified: a person's identity as verified with the bot (!admin verify); a new identity stops
+# everything until they verify again. cross_signed: every device they signed with their
+# current identity; a new identity is accepted and logged (mxbot-common, 2026-10-19).
+trust = "cross_signed"
+
+[security.verification]
+allowed_users = []
+allow_users_from_joined_rooms = true
+
+[security.admin_dm]
+enabled = true
+require_encryption = true
+require_verified_device = false
+# Also the bot's broadcast posts (digests, reminders) into the admins' private chats.
+receive_broadcasts = false
+
+[imap]
+host = "mail.example.org"
+port = 993
+username = "bot@example.org"
+mailbox = "INBOX"
+poll_interval_secs = 60
+initial_fetch_limit = 50
+skip_initial_history = true   # the new store starts empty: no flood of old mail
+
+[mailing_list]
+list_id = "list@lists.example.org"
+sender_emails = ["list@lists.example.org"]   # Riseup sets From to the list address
+
+[smtp]
+host = "mail.example.org"
+port = 465
+username = "bot@example.org"
+from_address = "bot@example.org"
+list_address = "list@lists.example.org"
+require_smtps = true
+allow_new_threads_from_matrix = true
+list_confirmation_timeout_secs = 3600
+
+[limits]
+max_attachment_bytes = 10485760   # 10 MB
+max_body_bytes = 524288           # 512 KB
+max_quote_lines = 5

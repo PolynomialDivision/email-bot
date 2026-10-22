@@ -268,9 +268,17 @@ async fn sync_once(
     let mut sorted_uids = uids_to_fetch;
     sorted_uids.sort_unstable();
 
+    let mut cursor = UidCursor::default();
+
     for uid in sorted_uids {
         if db.uid_seen(mailbox, uid).await.unwrap_or(false) {
             debug!(uid = uid, mailbox = %mailbox, "IMAP: UID already seen, skipping");
+            // Seen after a UID that failed earlier: last_uid catches up once that is done.
+            if let Some(uid) = cursor.done(uid) {
+                db.set_last_uid(mailbox, uid)
+                    .await
+                    .context("IMAP: set_last_uid for a seen UID failed")?;
+            }
             continue;
         }
 
@@ -305,9 +313,11 @@ async fn sync_once(
                 db.mark_uid_seen(mailbox, uid, None)
                     .await
                     .context("IMAP: mark_uid_seen after fetch failed")?;
-                db.set_last_uid(mailbox, uid)
-                    .await
-                    .context("IMAP: set_last_uid after fetch failed")?;
+                if let Some(uid) = cursor.done(uid) {
+                    db.set_last_uid(mailbox, uid)
+                        .await
+                        .context("IMAP: set_last_uid after fetch failed")?;
+                }
             }
             Ok(None) => {
                 warn!(
@@ -322,14 +332,35 @@ async fn sync_once(
                     mailbox = %mailbox,
                     error = %e,
                     error_chain = ?e,
-                    "IMAP: failed to fetch message body, skipping UID"
+                    "IMAP: failed to fetch message body, retrying it next cycle"
                 );
                 // Continue with next UID rather than aborting the whole sync.
+                cursor.failed(uid);
             }
         }
     }
 
     Ok(())
+}
+
+/// How far `last_uid` may move in one sync cycle (UIDs in ascending order): up to the first
+/// UID whose fetch failed, so the next cycle's search finds that one again. (It used to move
+/// past it with the next message and the failed one was never fetched.) The messages after
+/// it are marked seen, so they are not posted twice.
+#[derive(Default)]
+struct UidCursor {
+    first_failed: Option<u32>,
+}
+
+impl UidCursor {
+    /// `uid` is done (posted or seen before): the `last_uid` to store, if it may move.
+    fn done(&self, uid: u32) -> Option<u32> {
+        self.first_failed.is_none().then_some(uid)
+    }
+
+    fn failed(&mut self, uid: u32) {
+        self.first_failed.get_or_insert(uid);
+    }
 }
 
 async fn fetch_all_uids(
@@ -393,4 +424,23 @@ async fn fetch_raw_email(
 
     debug!(uid = uid, "IMAP: fetch stream ended with no body");
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UidCursor;
+
+    #[test]
+    fn last_uid_stops_before_a_failed_fetch() {
+        let mut cursor = UidCursor::default();
+        assert_eq!(cursor.done(10), Some(10));
+        cursor.failed(11);
+        assert_eq!(cursor.done(12), None);
+        cursor.failed(13);
+        assert_eq!(cursor.first_failed, Some(11));
+        // next cycle: 11 succeeds, 12 is seen already, last_uid catches up
+        let next = UidCursor::default();
+        assert_eq!(next.done(11), Some(11));
+        assert_eq!(next.done(12), Some(12));
+    }
 }

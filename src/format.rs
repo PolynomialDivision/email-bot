@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use mxbot_common::format::html_escape;
 
 use crate::config::LimitsConfig;
 use crate::email::{get_plain_body, ParsedEmail};
@@ -156,13 +157,6 @@ fn strip_one_re(s: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 fn build_html_body(email: &ParsedEmail, plain_collapsed: &str, max_quote: usize) -> String {

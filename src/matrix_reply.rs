@@ -510,14 +510,12 @@ async fn get_display_name(room: &Room, user_id: &OwnedUserId) -> String {
     user_id.localpart().to_owned()
 }
 
-/// Strip quoted lines and Matrix reply-fallback boilerplate, returning clean plaintext.
+/// Strip a reply fallback (the quoted lines at the top) and surrounding blank lines,
+/// returning clean plaintext. A quote further down is the sender's own and goes out with
+/// the mail (it used to be dropped with every other `> ` line).
 fn sanitize_reply_body(raw: &str) -> String {
-    let lines: Vec<&str> = raw
+    let lines: Vec<&str> = mxbot_common::format::strip_reply_fallback(raw)
         .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !t.starts_with("> ") && t != ">"
-        })
         .collect();
 
     let start = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
@@ -554,6 +552,15 @@ mod tests {
     fn empty_after_stripping() {
         let input = "> everything is quoted\n> nothing left";
         assert!(sanitize_reply_body(input).is_empty());
+    }
+
+    #[test]
+    fn quotes_below_the_reply_are_kept() {
+        let input = "> fallback\n\nAs you wrote:\n> the meeting is at 8\nI agree.";
+        assert_eq!(
+            sanitize_reply_body(input),
+            "As you wrote:\n> the meeting is at 8\nI agree."
+        );
     }
 
     #[test]

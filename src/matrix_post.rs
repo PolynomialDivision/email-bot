@@ -9,11 +9,12 @@ use mxbot_common::matrix_sdk::{
                 ImageInfo,
             },
         },
-        OwnedEventId, UInt,
+        OwnedEventId, OwnedTransactionId, UInt,
     },
     RoomState,
 };
-use mxbot_common::Bot;
+use mxbot_common::{send::send_with_retry_txn, Bot};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::LimitsConfig;
@@ -77,6 +78,7 @@ pub async fn post_email(
         None
     };
 
+    let txn_base = post_transaction_base(&email.message_id, &plain);
     let mut content = RoomMessageEventContent::text_html(plain, html);
 
     if let Some((ref root_event_id_str, _)) = thread_info {
@@ -108,11 +110,8 @@ pub async fn post_email(
         .collect();
 
     if rooms.is_empty() {
-        warn!(
-            message_id = %email.message_id,
-            "matrix_post: no joined rooms, email cannot be posted (check bot invite)"
-        );
-        return Ok(());
+        // An error, not Ok: the email goes to the retry queue instead of being dropped.
+        anyhow::bail!("no joined room to post the email to (check the bot's invite)");
     }
 
     debug!(
@@ -125,9 +124,10 @@ pub async fn post_email(
 
     for room in &rooms {
         let t_send = std::time::Instant::now();
-        match room.send(content.clone()).await {
-            Ok(resp) => {
-                let event_id = resp.response.event_id.to_string();
+        let txn_id = transaction_id(&txn_base, room.room_id().as_str(), "post");
+        match send_with_retry_txn(room, content.clone(), &txn_id).await {
+            Ok(event_id) => {
+                let event_id = event_id.to_string();
                 info!(
                     message_id = %email.message_id,
                     room_id = %room.room_id(),
@@ -196,13 +196,33 @@ pub async fn post_email(
             count = email.attachments.len(),
             "matrix_post: posting attachments"
         );
-        post_attachments(bot, email, limits).await;
+        post_attachments(bot, email, limits, &txn_base).await;
     }
 
     Ok(())
 }
 
-async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig) {
+/// The base of this email's transaction IDs: the same email (Message-ID and text) gets the
+/// same IDs, so a post retried from the queue after a partial failure (one room done, the
+/// next failed) returns the events already posted instead of posting them twice. The text is
+/// part of it so two different emails with one generated ID (`uid-N`) never collide.
+fn post_transaction_base(message_id: &str, plain: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(message_id.as_bytes());
+    hash.update([0]);
+    hash.update(plain.as_bytes());
+    hash.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// One transaction ID per email, room and part (`post`, `attachment-N`).
+fn transaction_id(base: &str, room_id: &str, part: &str) -> OwnedTransactionId {
+    format!("email-{base}-{room_id}-{part}").into()
+}
+
+async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig, txn_base: &str) {
     let max_bytes = limits.effective_max_attachment_bytes();
     let rooms: Vec<_> = bot
         .broadcast_rooms()
@@ -281,7 +301,12 @@ async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig)
                 };
 
                 for room in &rooms {
-                    if let Err(e) = room.send(content.clone()).await {
+                    let txn_id = transaction_id(
+                        txn_base,
+                        room.room_id().as_str(),
+                        &format!("attachment-{idx}"),
+                    );
+                    if let Err(e) = send_with_retry_txn(room, content.clone(), &txn_id).await {
                         warn!(
                             message_id = %email.message_id,
                             filename = %attachment.filename,
@@ -310,5 +335,35 @@ async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig)
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_ids_are_stable_per_email_room_and_part() {
+        let base = post_transaction_base("abc@example.org", "📧 Hello");
+        assert_eq!(base, post_transaction_base("abc@example.org", "📧 Hello"));
+        assert_eq!(base.len(), 32);
+        // a generated Message-ID shared by two different emails
+        assert_ne!(
+            post_transaction_base("uid-5", "📧 One"),
+            post_transaction_base("uid-5", "📧 Two")
+        );
+        let room = "!room:example.org";
+        assert_eq!(
+            transaction_id(&base, room, "post"),
+            transaction_id(&base, room, "post")
+        );
+        assert_ne!(
+            transaction_id(&base, room, "post"),
+            transaction_id(&base, "!other:example.org", "post")
+        );
+        assert_ne!(
+            transaction_id(&base, room, "post"),
+            transaction_id(&base, room, "attachment-0")
+        );
     }
 }
