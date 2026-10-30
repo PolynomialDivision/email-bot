@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use mxbot_common::supervise::Alive;
 use native_tls::TlsConnector as NativeTlsConnector;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -18,11 +19,13 @@ pub async fn imap_loop(
     imap_password: String,
     tx: mpsc::Sender<RawEmail>,
     db: Db,
+    alive: Alive,
 ) {
     let mut reconnect_delay = Duration::from_secs(5);
     let mut attempt = 0u32;
 
     loop {
+        alive.tick();
         attempt += 1;
         info!(
             attempt = attempt,
@@ -31,7 +34,7 @@ pub async fn imap_loop(
             reconnect_delay_secs = reconnect_delay.as_secs(),
             "IMAP: connecting"
         );
-        match connect_and_sync(&config, &imap_password, &tx, &db).await {
+        match connect_and_sync(&config, &imap_password, &tx, &db, &alive).await {
             Ok(()) => {
                 // Normally connect_and_sync loops forever; Ok(()) means a clean exit.
                 info!(attempt = attempt, "IMAP: sync loop exited cleanly");
@@ -60,6 +63,7 @@ async fn connect_and_sync(
     password: &str,
     tx: &mpsc::Sender<RawEmail>,
     db: &Db,
+    alive: &Alive,
 ) -> Result<()> {
     let addr = format!("{}:{}", config.host, config.port);
 
@@ -137,6 +141,7 @@ async fn connect_and_sync(
 
     let mut poll_count = 0u64;
     loop {
+        alive.tick();
         poll_count += 1;
         debug!(poll = poll_count, mailbox = %mailbox, "IMAP: poll cycle start");
         let t_poll = Instant::now();

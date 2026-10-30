@@ -1,4 +1,4 @@
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mxbot_common::{
@@ -11,6 +11,7 @@ use mxbot_common::{
         },
         Client, Room, RoomState,
     },
+    supervise::{supervise, supervise_ticking, Alive},
     Bot,
 };
 use tokio::{fs, sync::mpsc, time::sleep};
@@ -48,24 +49,9 @@ fn install_panic_hook() {
         tracing::error!(
             panic.location = %location,
             panic.message = %message,
-            "PANIC: task crashed. Set RUST_BACKTRACE=1 for stack trace"
+            "PANIC: the bot ends (panic = \"abort\") and Docker restarts it. Set RUST_BACKTRACE=1 for stack trace"
         );
     }));
-}
-
-fn spawn_task<F>(name: &'static str, fut: F) -> tokio::task::JoinHandle<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        info!(task = name, "Task started");
-        fut.await;
-        // Background tasks are expected to loop forever; reaching here is abnormal.
-        warn!(
-            task = name,
-            "Task exited. This task should run indefinitely"
-        );
-    })
 }
 
 #[tokio::main]
@@ -263,45 +249,51 @@ async fn main() -> Result<()> {
     let mailing_list_config = config.mailing_list;
     let limits_config = config.limits;
 
+    // Background tasks run as long as the bot: if one ends, the process exits and the
+    // container is restarted. A loop in rounds that misses its ticks for `within` makes the
+    // health check fail.
     let db_imap = db.clone();
-    let _imap_handle = spawn_task("imap_sync", async move {
-        imap_sync::imap_loop(imap_config, imap_password, tx, db_imap).await;
+    // A round per poll or reconnect (backoff up to 300s); a round may fetch many emails.
+    let imap_within =
+        Duration::from_secs(3 * (imap_config.effective_poll_interval_secs().max(300) + 600));
+    let _imap_handle = supervise_ticking("imap sync", imap_within, |alive| {
+        imap_sync::imap_loop(imap_config, imap_password, tx, db_imap, alive)
     });
 
     let db_sender = db.clone();
     let bot_sender = bot.clone();
     let limits_sender = limits_config.clone();
     let mailing_list_sender = mailing_list_config.clone();
-    let _send_handle = spawn_task("matrix_send", async move {
+    let _send_handle = supervise(
+        "matrix send",
         matrix_send_loop(
             bot_sender,
             rx,
             db_sender,
             mailing_list_sender,
             limits_sender,
-        )
-        .await;
-    });
+        ),
+    );
 
     let db_cleanup = db.clone();
-    let _cleanup_handle = spawn_task("cleanup", async move {
-        cleanup_loop(db_cleanup).await;
-    });
+    let _cleanup_handle = supervise("cleanup", cleanup_loop(db_cleanup));
 
     let db_retry = db.clone();
     let bot_retry = bot.clone();
     let limits_retry = limits_config.clone();
-    let _retry_handle = spawn_task("email_retry", async move {
-        retry_loop(bot_retry, db_retry, limits_retry).await;
+    let _retry_handle = supervise_ticking("email retry", Duration::from_secs(45 * 60), |alive| {
+        retry_loop(bot_retry, db_retry, limits_retry, alive)
     });
 
     let _smtp_retry_handle =
         if let (Some(smtp_cfg), Some(smtp_pw)) = (smtp_config_opt, secrets.smtp_password.clone()) {
             info!("Spawning SMTP retry worker");
             let db_smtp_retry = db.clone();
-            Some(spawn_task("smtp_retry", async move {
-                smtp_retry_loop(db_smtp_retry, smtp_cfg, smtp_pw).await;
-            }))
+            Some(supervise_ticking(
+                "smtp retry",
+                Duration::from_secs(45 * 60),
+                |alive| smtp_retry_loop(db_smtp_retry, smtp_cfg, smtp_pw, alive),
+            ))
         } else {
             debug!("SMTP retry worker not started (no SMTP config or SMTP_PASSWORD)");
             None
@@ -315,9 +307,18 @@ async fn main() -> Result<()> {
         );
         let db_confirmation = db.clone();
         let client_confirmation = bot.client.clone();
-        Some(spawn_task("delivery_confirmation", async move {
-            delivery_confirmation_loop(client_confirmation, db_confirmation, timeout_secs).await;
-        }))
+        Some(supervise_ticking(
+            "delivery confirmation",
+            Duration::from_secs(15 * 60),
+            |alive| {
+                delivery_confirmation_loop(
+                    client_confirmation,
+                    db_confirmation,
+                    timeout_secs,
+                    alive,
+                )
+            },
+        ))
     } else {
         info!("Mailing-list confirmation notices disabled");
         None
@@ -548,10 +549,11 @@ async fn matrix_send_loop(
     warn!("Matrix send loop: channel closed, IMAP sync task may have exited");
 }
 
-async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
+async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive) {
     info!("Email retry loop: started (poll interval: 300s)");
     loop {
         sleep(Duration::from_secs(300)).await;
+        alive.tick();
         debug!("Email retry loop: polling queue");
 
         match db.pop_retry(10).await {
@@ -632,7 +634,12 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig) {
     }
 }
 
-async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password: String) {
+async fn smtp_retry_loop(
+    db: Db,
+    smtp_config: config::SmtpConfig,
+    smtp_password: String,
+    alive: Alive,
+) {
     let tls_mode = if smtp_config.require_smtps {
         "SMTPS"
     } else {
@@ -646,6 +653,7 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
     );
 
     loop {
+        alive.tick();
         debug!("SMTP retry loop: polling queue");
         let items = match db.get_failed_smtp_routes(10).await {
             Ok(v) => v,
@@ -747,9 +755,10 @@ async fn smtp_retry_loop(db: Db, smtp_config: config::SmtpConfig, smtp_password:
     }
 }
 
-async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64) {
+async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, alive: Alive) {
     const NOTICE_LEASE_SECS: i64 = 300;
     loop {
+        alive.tick();
         match db
             .claim_unconfirmed_delivery(timeout_secs as i64, NOTICE_LEASE_SECS)
             .await
