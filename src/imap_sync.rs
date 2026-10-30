@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use mxbot_common::supervise::Alive;
 use native_tls::TlsConnector as NativeTlsConnector;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tokio_native_tls::TlsConnector;
 use tracing::{debug, error, info, warn};
@@ -14,10 +14,26 @@ use crate::config::ImapConfig;
 use crate::db::Db;
 use crate::email::RawEmail;
 
+/// What the send loop did with a fetched email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handled {
+    /// Posted, put into the retry queue, or deliberately not posted (not from the list, a
+    /// bridge echo, unparseable): the UID may be marked seen.
+    Done,
+    /// Neither posted nor queued: the UID stays unseen and is fetched again next cycle.
+    Again,
+}
+
+/// A fetched email on its way to the send loop, with the channel for its outcome.
+pub struct Fetched {
+    pub raw: RawEmail,
+    pub handled: oneshot::Sender<Handled>,
+}
+
 pub async fn imap_loop(
     config: ImapConfig,
     imap_password: String,
-    tx: mpsc::Sender<RawEmail>,
+    tx: mpsc::Sender<Fetched>,
     db: Db,
     alive: Alive,
 ) {
@@ -51,6 +67,9 @@ pub async fn imap_loop(
                     error_chain = ?e,
                     "IMAP: connection/sync failed, will reconnect in {}s", reconnect_delay.as_secs()
                 );
+                // A failure that keeps coming back (a wrong password) turns the container
+                // unhealthy after the loop's time; a short outage does not.
+                alive.failed(health_reason(&e, &imap_password));
                 sleep(reconnect_delay).await;
                 reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(300));
             }
@@ -61,7 +80,7 @@ pub async fn imap_loop(
 async fn connect_and_sync(
     config: &ImapConfig,
     password: &str,
-    tx: &mpsc::Sender<RawEmail>,
+    tx: &mpsc::Sender<Fetched>,
     db: &Db,
     alive: &Alive,
 ) -> Result<()> {
@@ -117,12 +136,12 @@ async fn connect_and_sync(
         .login(&config.username, password)
         .await
         .map_err(|(e, _)| {
-            anyhow::anyhow!(
-                "IMAP LOGIN failed for user '{}' on {}: {}, check IMAP username and IMAP_PASSWORD",
-                config.username,
-                config.host,
-                e
-            )
+            // The server's answer stays the error's source: `health_reason` shows only its
+            // short NO/BAD text.
+            anyhow::Error::new(e).context(format!(
+                "IMAP LOGIN failed for user '{}' on {} (check IMAP username and IMAP_PASSWORD)",
+                config.username, config.host
+            ))
         })?;
     info!(
         username = %config.username,
@@ -145,7 +164,10 @@ async fn connect_and_sync(
         poll_count += 1;
         debug!(poll = poll_count, mailbox = %mailbox, "IMAP: poll cycle start");
         let t_poll = Instant::now();
-        sync_once(config, &mut session, tx, db).await?;
+        match sync_once(config, &mut session, tx, db, alive).await? {
+            None => alive.ok(),
+            Some(e) => alive.failed(health_reason(&e, password)),
+        }
         debug!(
             poll = poll_count,
             mailbox = %mailbox,
@@ -156,12 +178,25 @@ async fn connect_and_sync(
     }
 }
 
+/// One poll cycle. `Ok(Some(error))`: the cycle went on, but a message could not be fetched,
+/// or was fetched but neither posted nor queued for a retry (the last such error); it is
+/// fetched again next cycle, and the cycle counts as failed for the health check.
+///
+/// A message that fails like this every time keeps the container unhealthy, and `last_uid`
+/// stays before it, by design: it is not posted, and nothing skips it silently. The reason
+/// names its UID and the step. What an admin does: for a failed fetch, look at that UID on
+/// the IMAP server and move it out of the mailbox (to another folder) with a mail client;
+/// the next cycle no longer finds it, gets past it and turns healthy again. (Marking it
+/// \Seen in the mail client does not help: the bot keeps its own seen list.) For "neither
+/// posted nor queued", fix the bot's database first (disk full, read-only volume: see the
+/// log); the message then goes out by itself.
 async fn sync_once(
     config: &ImapConfig,
     session: &mut async_imap::Session<tokio_native_tls::TlsStream<TcpStream>>,
-    tx: &mpsc::Sender<RawEmail>,
+    tx: &mpsc::Sender<Fetched>,
     db: &Db,
-) -> Result<()> {
+    alive: &Alive,
+) -> Result<Option<anyhow::Error>> {
     let mailbox = config.effective_mailbox();
 
     debug!(mailbox = %mailbox, "IMAP: SELECT mailbox");
@@ -217,7 +252,7 @@ async fn sync_once(
             } else {
                 info!(mailbox = %mailbox, "IMAP: mailbox empty on first run");
             }
-            return Ok(());
+            return Ok(None);
         } else {
             let limit = config.effective_initial_fetch_limit();
             info!(
@@ -260,7 +295,7 @@ async fn sync_once(
 
     if uids_to_fetch.is_empty() {
         debug!(mailbox = %mailbox, "IMAP: no new messages");
-        return Ok(());
+        return Ok(None);
     }
 
     info!(
@@ -274,6 +309,7 @@ async fn sync_once(
     sorted_uids.sort_unstable();
 
     let mut cursor = UidCursor::default();
+    let mut fetch_failed = None;
 
     for uid in sorted_uids {
         if db.uid_seen(mailbox, uid).await.unwrap_or(false) {
@@ -305,23 +341,20 @@ async fn sync_once(
                     raw: raw_bytes,
                 };
 
-                if tx.send(raw).await.is_err() {
+                // Seen only once it was posted or queued for a retry: a restart (or a failed
+                // post that could not be queued) before that fetches it again. Reposting it is
+                // harmless, the post's transaction IDs come from the email.
+                let Some(handled) = hand_over(tx, raw).await else {
                     warn!(
                         uid = uid,
                         mailbox = %mailbox,
                         "IMAP: processing channel closed, matrix_send task may have exited"
                     );
-                    return Ok(());
-                }
-                debug!(uid = uid, mailbox = %mailbox, "IMAP: message queued for Matrix posting");
-
-                db.mark_uid_seen(mailbox, uid, None)
-                    .await
-                    .context("IMAP: mark_uid_seen after fetch failed")?;
-                if let Some(uid) = cursor.done(uid) {
-                    db.set_last_uid(mailbox, uid)
-                        .await
-                        .context("IMAP: set_last_uid after fetch failed")?;
+                    return Ok(fetch_failed);
+                };
+                alive.tick();
+                if let Some(e) = record_handled(db, mailbox, uid, handled, &mut cursor).await? {
+                    fetch_failed = Some(e);
                 }
             }
             Ok(None) => {
@@ -341,11 +374,97 @@ async fn sync_once(
                 );
                 // Continue with next UID rather than aborting the whole sync.
                 cursor.failed(uid);
+                fetch_failed = Some(e);
             }
         }
     }
 
-    Ok(())
+    Ok(fetch_failed)
+}
+
+/// What the health check shows for a failed IMAP step: our own description of the step,
+/// and from the cause only its kind and the server's short NO/BAD text. Never the password
+/// (cut out should a server echo it) and never mail content (an unreadable answer is named,
+/// not shown).
+fn health_reason(error: &anyhow::Error, password: &str) -> String {
+    let mut reason = error.to_string();
+    if let Some(detail) = error.chain().find_map(cause_detail) {
+        reason = format!("{reason}: {detail}");
+    }
+    if !password.is_empty() {
+        reason = reason.replace(password, "***");
+    }
+    let mut reason = reason.lines().next().unwrap_or_default().trim().to_owned();
+    if reason.chars().count() > 200 {
+        reason = reason.chars().take(199).collect::<String>() + "…";
+    }
+    reason
+}
+
+fn cause_detail(cause: &(dyn std::error::Error + 'static)) -> Option<String> {
+    use async_imap::error::Error as Imap;
+    if let Some(e) = cause.downcast_ref::<Imap>() {
+        return Some(match e {
+            Imap::No(text) => format!("NO {}", text.trim()),
+            Imap::Bad(text) => format!("BAD {}", text.trim()),
+            Imap::Io(io) => io.kind().to_string(),
+            Imap::ConnectionLost => "connection lost".to_owned(),
+            _ => "unreadable answer from the server".to_owned(),
+        });
+    }
+    if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+        return Some(io.kind().to_string());
+    }
+    // Certificate or handshake problems, in the TLS library's words.
+    cause
+        .downcast_ref::<native_tls::Error>()
+        .map(|e| e.to_string())
+}
+
+/// Gives a fetched email to the send loop and waits until it was posted or queued.
+/// `None` when the send loop is gone.
+async fn hand_over(tx: &mpsc::Sender<Fetched>, raw: RawEmail) -> Option<Handled> {
+    let (handled, outcome) = oneshot::channel();
+    tx.send(Fetched { raw, handled }).await.ok()?;
+    outcome.await.ok()
+}
+
+/// Marks a handed-over UID seen (and moves `last_uid`) when it is done; otherwise leaves it
+/// for the next cycle, like a failed fetch, and returns the failure the cycle reports to the
+/// health check (UID and step only, nothing from the email).
+async fn record_handled(
+    db: &Db,
+    mailbox: &str,
+    uid: u32,
+    handled: Handled,
+    cursor: &mut UidCursor,
+) -> Result<Option<anyhow::Error>> {
+    match handled {
+        Handled::Done => {
+            debug!(uid = uid, mailbox = %mailbox, "IMAP: message handled, marking it seen");
+            db.mark_uid_seen(mailbox, uid, None)
+                .await
+                .context("IMAP: mark_uid_seen after posting failed")?;
+            if let Some(uid) = cursor.done(uid) {
+                db.set_last_uid(mailbox, uid)
+                    .await
+                    .context("IMAP: set_last_uid after posting failed")?;
+            }
+        }
+        Handled::Again => {
+            warn!(
+                uid = uid,
+                mailbox = %mailbox,
+                "IMAP: message neither posted nor queued, fetching it again next cycle"
+            );
+            cursor.failed(uid);
+            return Ok(Some(anyhow::anyhow!(
+                "IMAP UID {uid} in {mailbox}: fetched, but neither posted to Matrix nor put \
+                 into the retry queue (check the bot's database); fetching it again next cycle"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// How far `last_uid` may move in one sync cycle (UIDs in ascending order): up to the first
@@ -433,7 +552,97 @@ async fn fetch_raw_email(
 
 #[cfg(test)]
 mod tests {
-    use super::UidCursor;
+    use super::{hand_over, health_reason, record_handled, Fetched, Handled, UidCursor};
+    use crate::db::Db;
+    use crate::email::RawEmail;
+    use tokio::sync::mpsc;
+
+    fn raw(uid: u32) -> RawEmail {
+        RawEmail {
+            uid,
+            mailbox: "INBOX".to_owned(),
+            raw: b"Subject: x\r\n\r\nbody".to_vec(),
+        }
+    }
+
+    /// A send loop that answers every email with `outcome` (None: drops it unanswered).
+    fn send_loop(outcome: Option<Handled>) -> mpsc::Sender<Fetched> {
+        let (tx, mut rx) = mpsc::channel::<Fetched>(4);
+        tokio::spawn(async move {
+            while let Some(Fetched { handled, .. }) = rx.recv().await {
+                if let Some(outcome) = outcome {
+                    let _ = handled.send(outcome);
+                }
+            }
+        });
+        tx
+    }
+
+    #[tokio::test]
+    async fn uid_is_seen_only_after_it_was_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("email-bot.sqlite3")).unwrap();
+        let mut cursor = UidCursor::default();
+
+        // Posted (or queued): seen, last_uid moves.
+        let handled = hand_over(&send_loop(Some(Handled::Done)), raw(10)).await;
+        assert_eq!(handled, Some(Handled::Done));
+        let failure = record_handled(&db, "INBOX", 10, Handled::Done, &mut cursor)
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert!(db.uid_seen("INBOX", 10).await.unwrap());
+        assert_eq!(db.get_last_uid("INBOX").await.unwrap(), 10);
+
+        // Neither posted nor queued: not seen, last_uid stays before it, so the next
+        // cycle's search (UID 11:*) finds it again; later UIDs no longer move last_uid.
+        let handled = hand_over(&send_loop(Some(Handled::Again)), raw(11)).await;
+        assert_eq!(handled, Some(Handled::Again));
+        let failure = record_handled(&db, "INBOX", 11, Handled::Again, &mut cursor)
+            .await
+            .unwrap();
+        assert!(failure.is_some());
+        assert!(!db.uid_seen("INBOX", 11).await.unwrap());
+        let failure = record_handled(&db, "INBOX", 12, Handled::Done, &mut cursor)
+            .await
+            .unwrap();
+        assert!(failure.is_none());
+        assert!(db.uid_seen("INBOX", 12).await.unwrap());
+        assert_eq!(db.get_last_uid("INBOX").await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn an_email_neither_posted_nor_queued_fails_the_cycle() {
+        // A broken retry queue used to leave the poll cycle ok: the container stayed healthy
+        // while the email was fetched again and again.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("email-bot.sqlite3")).unwrap();
+        let mut cursor = UidCursor::default();
+        let failure = record_handled(&db, "Lists/house", 42, Handled::Again, &mut cursor)
+            .await
+            .unwrap()
+            .expect("Again fails the cycle");
+        let reason = health_reason(&failure, "hunter2");
+        // Names the UID, the mailbox and the step, so an admin can find it; nothing from the
+        // email itself (record_handled never sees it).
+        assert!(
+            reason.starts_with("IMAP UID 42 in Lists/house: "),
+            "{reason}"
+        );
+        assert!(reason.contains("retry queue"), "{reason}");
+        assert!(!reason.contains("Subject"), "{reason}");
+        assert!(reason.chars().count() <= 200, "{reason}");
+        assert!(!db.uid_seen("Lists/house", 42).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn email_dropped_by_the_send_loop_is_not_handled() {
+        // The send loop ended mid-way (or never answered): no outcome, nothing marked.
+        assert_eq!(hand_over(&send_loop(None), raw(7)).await, None);
+        let (tx, rx) = mpsc::channel::<Fetched>(1);
+        drop(rx);
+        assert_eq!(hand_over(&tx, raw(8)).await, None);
+    }
 
     #[test]
     fn last_uid_stops_before_a_failed_fetch() {
@@ -447,5 +656,52 @@ mod tests {
         let next = UidCursor::default();
         assert_eq!(next.done(11), Some(11));
         assert_eq!(next.done(12), Some(12));
+    }
+
+    #[test]
+    fn the_health_reason_names_the_step_and_the_servers_answer() {
+        let refused = anyhow::Error::new(async_imap::error::Error::No(
+            "[AUTHENTICATIONFAILED] Invalid credentials (Failure)".into(),
+        ))
+        .context("IMAP LOGIN failed for user 'list' on imap.example.org (check IMAP username and IMAP_PASSWORD)");
+        assert_eq!(
+            health_reason(&refused, "hunter2"),
+            "IMAP LOGIN failed for user 'list' on imap.example.org (check IMAP username and \
+             IMAP_PASSWORD): NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)"
+        );
+
+        let io = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let unreachable =
+            anyhow::Error::new(io).context("IMAP TCP connect to imap.example.org:993 failed");
+        assert_eq!(
+            health_reason(&unreachable, "hunter2"),
+            "IMAP TCP connect to imap.example.org:993 failed: connection refused"
+        );
+    }
+
+    #[test]
+    fn the_health_reason_never_shows_the_password_or_mail_content() {
+        let echoed = anyhow::Error::new(async_imap::error::Error::Bad(
+            "Unknown command LOGIN list hunter2\r\nsecond line".into(),
+        ))
+        .context("IMAP LOGIN failed for user 'list' on imap.example.org");
+        let reason = health_reason(&echoed, "hunter2");
+        assert!(!reason.contains("hunter2"), "{reason}");
+        assert!(!reason.contains("second line"), "{reason}");
+
+        let mail = b"Subject: private\r\n\r\nthe body \xff".to_vec();
+        let utf8 = std::str::from_utf8(&mail).unwrap_err();
+        let unreadable = anyhow::Error::new(async_imap::error::Error::Parse(
+            async_imap::error::ParseError::DataNotUtf8(mail, utf8),
+        ))
+        .context("IMAP fetch stream error for UID 7");
+        assert_eq!(
+            health_reason(&unreadable, "hunter2"),
+            "IMAP fetch stream error for UID 7: unreadable answer from the server"
+        );
+
+        let long = anyhow::Error::new(async_imap::error::Error::No("x".repeat(500)))
+            .context("IMAP SELECT INBOX failed");
+        assert_eq!(health_reason(&long, "").chars().count(), 200);
     }
 }

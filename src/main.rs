@@ -30,6 +30,7 @@ mod smtp_send;
 use config::{parse_allowed_repliers, Config, Secrets};
 use db::Db;
 use email::{ParsedEmail, RawEmail};
+use imap_sync::{Fetched, Handled};
 
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
@@ -241,7 +242,7 @@ async fn main() -> Result<()> {
     }
 
     // IMAP → parse → post channel
-    let (tx, rx) = mpsc::channel::<RawEmail>(100);
+    let (tx, rx) = mpsc::channel::<Fetched>(100);
     debug!("Email processing channel created (capacity=100)");
 
     let imap_config = config.imap;
@@ -390,163 +391,184 @@ fn print_startup_diagnostics(config: &Config, secrets: &Secrets, db_path: &std::
 
 async fn matrix_send_loop(
     bot: Bot,
-    mut rx: mpsc::Receiver<RawEmail>,
+    mut rx: mpsc::Receiver<Fetched>,
     db: Db,
     mailing_list_config: config::MailingListConfig,
     limits: config::LimitsConfig,
 ) {
     info!("Matrix send loop: ready, waiting for emails");
-    while let Some(raw) = rx.recv().await {
-        let uid = raw.uid;
-        let mailbox = raw.mailbox.clone();
-        debug!(uid = uid, mailbox = %mailbox, bytes = raw.raw.len(), "Matrix send loop: received raw email");
-
-        match email::parse(&raw, &limits) {
-            Err(e) => {
-                warn!(uid = uid, mailbox = %mailbox, error = %e, "Failed to parse email, skipping");
-                continue;
-            }
-            Ok(mut parsed) => {
-                debug!(
-                    uid = uid,
-                    message_id = %parsed.message_id,
-                    subject = %parsed.subject,
-                    from = %parsed.from_email,
-                    "Email parsed"
-                );
-
-                let is_list_email = email::is_mailing_list_email(&parsed, &mailing_list_config);
-                if is_list_email {
-                    match db
-                        .confirm_list_delivery(
-                            &parsed.message_id,
-                            parsed.matrix_event_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(Some(confirmation)) => info!(
-                            uid = uid,
-                            message_id = %parsed.message_id,
-                            matrix_event_id = %confirmation.matrix_event_id,
-                            previous_status = %confirmation.previous_status,
-                            matched_by = if parsed.matrix_event_id.as_deref() == Some(confirmation.matrix_event_id.as_str()) {
-                                "matrix_event_id"
-                            } else {
-                                "message_id"
-                            },
-                            "Mailing-list delivery confirmed"
-                        ),
-                        Ok(None) => debug!(
-                            uid = uid,
-                            message_id = %parsed.message_id,
-                            matrix_event_id = ?parsed.matrix_event_id,
-                            "Mailing-list message did not match an awaiting delivery"
-                        ),
-                        Err(e) => warn!(
-                            uid = uid,
-                            message_id = %parsed.message_id,
-                            error = %e,
-                            "Failed to check mailing-list delivery correlation"
-                        ),
-                    }
-                }
-
-                // Layer 1 loop guard: X-Bridge-Origin header set by this bridge on send.
-                if parsed.bridge_origin.as_deref() == Some("matrix") {
-                    info!(
-                        uid = uid,
-                        message_id = %parsed.message_id,
-                        "Loop guard (L1): skipping bridge-echo (X-Bridge-Origin: matrix)"
-                    );
-                    continue;
-                }
-
-                // Layer 2 loop guard: check DB for emails we sent (catches header-stripped bounces).
-                match db.is_bridge_sent_email(&parsed.message_id).await {
-                    Ok(true) => {
-                        info!(
-                            uid = uid,
-                            message_id = %parsed.message_id,
-                            "Loop guard (L2): skipping bridge-echo (found in message_routes as sent)"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(
-                            uid = uid,
-                            message_id = %parsed.message_id,
-                            error = %e,
-                            "DB error on bridge-echo check: proceeding to avoid lost content"
-                        );
-                    }
-                    Ok(false) => {
-                        debug!(uid = uid, message_id = %parsed.message_id, "Loop guard passed");
-                    }
-                }
-
-                if !is_list_email {
-                    info!(
-                        uid = uid,
-                        message_id = %parsed.message_id,
-                        from = %parsed.from_email,
-                        list_id = ?parsed.list_id,
-                        "Skipping non-list email"
-                    );
-                    continue;
-                }
-
-                debug!(uid = uid, message_id = %parsed.message_id, "Reconstructing email thread");
-                email::reconstruct_thread(&mut parsed, &db).await;
-                debug!(
-                    uid = uid,
-                    message_id = %parsed.message_id,
-                    thread_root = ?parsed.thread_root,
-                    "Thread reconstruction complete"
-                );
-
-                let t_post = std::time::Instant::now();
-                if let Err(e) = matrix_post::post_email(&bot, &parsed, &db, &limits).await {
-                    warn!(
-                        uid = uid,
-                        message_id = %parsed.message_id,
-                        error = %e,
-                        error_chain = ?e,
-                        "Failed to post email to Matrix: adding to retry queue"
-                    );
-                    match serde_json::to_string(&parsed) {
-                        Ok(payload) => {
-                            if let Err(db_err) = db.push_retry(&payload).await {
-                                error!(
-                                    uid = uid,
-                                    message_id = %parsed.message_id,
-                                    error = %db_err,
-                                    "Failed to push to retry queue: email may be lost"
-                                );
-                            } else {
-                                debug!(uid = uid, message_id = %parsed.message_id, "Email added to retry queue");
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                uid = uid,
-                                message_id = %parsed.message_id,
-                                error = %e,
-                                "Failed to serialize email for retry: email lost"
-                            );
-                        }
-                    }
-                } else {
-                    debug!(
-                        uid = uid,
-                        message_id = %parsed.message_id,
-                        elapsed_ms = t_post.elapsed().as_millis(),
-                        "Email posted to Matrix"
-                    );
-                }
-            }
-        }
+    while let Some(Fetched { raw, handled }) = rx.recv().await {
+        let outcome = handle_email(&bot, &raw, &db, &mailing_list_config, &limits).await;
+        // The IMAP side waits for this and marks the UID seen only when it is Done.
+        let _ = handled.send(outcome);
     }
     warn!("Matrix send loop: channel closed, IMAP sync task may have exited");
+}
+
+/// Parses, filters and posts one fetched email (or queues it for a retry).
+async fn handle_email(
+    bot: &Bot,
+    raw: &RawEmail,
+    db: &Db,
+    mailing_list_config: &config::MailingListConfig,
+    limits: &config::LimitsConfig,
+) -> Handled {
+    let uid = raw.uid;
+    let mailbox = raw.mailbox.clone();
+    debug!(uid = uid, mailbox = %mailbox, bytes = raw.raw.len(), "Matrix send loop: received raw email");
+
+    let mut parsed = match email::parse(raw, limits) {
+        Err(e) => {
+            warn!(uid = uid, mailbox = %mailbox, error = %e, "Failed to parse email, skipping");
+            return Handled::Done;
+        }
+        Ok(parsed) => parsed,
+    };
+    debug!(
+        uid = uid,
+        message_id = %parsed.message_id,
+        subject = %parsed.subject,
+        from = %parsed.from_email,
+        "Email parsed"
+    );
+
+    let is_list_email = email::is_mailing_list_email(&parsed, mailing_list_config);
+    if is_list_email {
+        match db
+            .confirm_list_delivery(&parsed.message_id, parsed.matrix_event_id.as_deref())
+            .await
+        {
+            Ok(Some(confirmation)) => info!(
+                uid = uid,
+                message_id = %parsed.message_id,
+                matrix_event_id = %confirmation.matrix_event_id,
+                previous_status = %confirmation.previous_status,
+                matched_by = if parsed.matrix_event_id.as_deref() == Some(confirmation.matrix_event_id.as_str()) {
+                    "matrix_event_id"
+                } else {
+                    "message_id"
+                },
+                "Mailing-list delivery confirmed"
+            ),
+            Ok(None) => debug!(
+                uid = uid,
+                message_id = %parsed.message_id,
+                matrix_event_id = ?parsed.matrix_event_id,
+                "Mailing-list message did not match an awaiting delivery"
+            ),
+            Err(e) => warn!(
+                uid = uid,
+                message_id = %parsed.message_id,
+                error = %e,
+                "Failed to check mailing-list delivery correlation"
+            ),
+        }
+    }
+
+    // Layer 1 loop guard: X-Bridge-Origin header set by this bridge on send.
+    if parsed.bridge_origin.as_deref() == Some("matrix") {
+        info!(
+            uid = uid,
+            message_id = %parsed.message_id,
+            "Loop guard (L1): skipping bridge-echo (X-Bridge-Origin: matrix)"
+        );
+        return Handled::Done;
+    }
+
+    // Layer 2 loop guard: check DB for emails we sent (catches header-stripped bounces).
+    match db.is_bridge_sent_email(&parsed.message_id).await {
+        Ok(true) => {
+            info!(
+                uid = uid,
+                message_id = %parsed.message_id,
+                "Loop guard (L2): skipping bridge-echo (found in message_routes as sent)"
+            );
+            return Handled::Done;
+        }
+        Err(e) => {
+            warn!(
+                uid = uid,
+                message_id = %parsed.message_id,
+                error = %e,
+                "DB error on bridge-echo check: proceeding to avoid lost content"
+            );
+        }
+        Ok(false) => {
+            debug!(uid = uid, message_id = %parsed.message_id, "Loop guard passed");
+        }
+    }
+
+    if !is_list_email {
+        info!(
+            uid = uid,
+            message_id = %parsed.message_id,
+            from = %parsed.from_email,
+            list_id = ?parsed.list_id,
+            "Skipping non-list email"
+        );
+        return Handled::Done;
+    }
+
+    debug!(uid = uid, message_id = %parsed.message_id, "Reconstructing email thread");
+    email::reconstruct_thread(&mut parsed, db).await;
+    debug!(
+        uid = uid,
+        message_id = %parsed.message_id,
+        thread_root = ?parsed.thread_root,
+        "Thread reconstruction complete"
+    );
+
+    let t_post = std::time::Instant::now();
+    if let Err(e) = matrix_post::post_email(bot, &parsed, db, limits).await {
+        warn!(
+            uid = uid,
+            message_id = %parsed.message_id,
+            error = %e,
+            error_chain = ?e,
+            "Failed to post email to Matrix: adding to retry queue"
+        );
+        return queue_for_retry(db, &parsed).await;
+    }
+    debug!(
+        uid = uid,
+        message_id = %parsed.message_id,
+        elapsed_ms = t_post.elapsed().as_millis(),
+        "Email posted to Matrix"
+    );
+    Handled::Done
+}
+
+/// Puts an email that could not be posted into the retry queue. `Again` when that fails
+/// too: the UID then stays unseen and IMAP fetches the email again next cycle.
+async fn queue_for_retry(db: &Db, parsed: &ParsedEmail) -> Handled {
+    let uid = parsed.uid;
+    match serde_json::to_string(parsed) {
+        Ok(payload) => match db.push_retry(&payload).await {
+            Err(db_err) => {
+                error!(
+                    uid = uid,
+                    message_id = %parsed.message_id,
+                    error = %db_err,
+                    "Failed to push to retry queue: fetching the email again next cycle"
+                );
+                Handled::Again
+            }
+            Ok(()) => {
+                debug!(uid = uid, message_id = %parsed.message_id, "Email added to retry queue");
+                Handled::Done
+            }
+        },
+        Err(e) => {
+            // Would fail the same way next time: fetching it again does not help.
+            error!(
+                uid = uid,
+                message_id = %parsed.message_id,
+                error = %e,
+                "Failed to serialize email for retry: email lost"
+            );
+            Handled::Done
+        }
+    }
 }
 
 async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive) {
@@ -882,5 +904,36 @@ async fn cleanup_loop(db: Db) {
             Ok(_) => debug!("Cleanup loop: no old thread mappings to remove"),
             Err(e) => error!(error = %e, "Cleanup loop: thread cleanup failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed_email() -> ParsedEmail {
+        let raw = RawEmail {
+            uid: 5,
+            mailbox: "INBOX".to_owned(),
+            raw: b"From: a@example.com\r\nSubject: Hi\r\nMessage-ID: <m5@example.com>\r\n\r\nBody"
+                .to_vec(),
+        };
+        email::parse(&raw, &config::LimitsConfig::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_post_is_done_once_it_is_in_the_retry_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("email-bot.sqlite3")).unwrap();
+        assert_eq!(queue_for_retry(&db, &parsed_email()).await, Handled::Done);
+        assert_eq!(db.retry_queue_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_post_that_cannot_be_queued_is_fetched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("email-bot.sqlite3")).unwrap();
+        db.break_retry_queue();
+        assert_eq!(queue_for_retry(&db, &parsed_email()).await, Handled::Again);
     }
 }

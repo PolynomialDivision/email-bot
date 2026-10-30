@@ -1,26 +1,28 @@
 use anyhow::{Context, Result};
 use mxbot_common::matrix_sdk::{
-    self,
     ruma::{
         events::{
             relation::Thread,
             room::{
-                message::{MessageType, Relation, RoomMessageEventContent},
-                ImageInfo,
+                message::{
+                    FileMessageEventContent, ImageMessageEventContent, MessageType, Relation,
+                    RoomMessageEventContent,
+                },
+                ImageInfo, MediaSource,
             },
         },
         OwnedEventId, OwnedTransactionId, UInt,
     },
     RoomState,
 };
-use mxbot_common::{send::send_with_retry_txn, Bot};
+use mxbot_common::{media, send::send_with_retry_txn, Bot};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::LimitsConfig;
 use crate::db::Db;
-use crate::email::ParsedEmail;
-use crate::format::format_email;
+use crate::email::{Attachment, ParsedEmail};
+use crate::format::{fit_to_event, format_email, MAX_EVENT_CONTENT_BYTES};
 
 pub async fn post_email(
     bot: &Bot,
@@ -39,6 +41,7 @@ pub async fn post_email(
     );
 
     let (plain, html) = format_email(email, limits);
+    let (plain, html) = fit_to_event(plain, html, MAX_EVENT_CONTENT_BYTES);
     debug!(
         message_id = %email.message_id,
         plain_len = plain.len(),
@@ -257,84 +260,100 @@ async fn post_attachments(bot: &Bot, email: &ParsedEmail, limits: &LimitsConfig,
             .parse()
             .unwrap_or(mime::APPLICATION_OCTET_STREAM);
 
-        debug!(
-            message_id = %email.message_id,
-            filename = %attachment.filename,
-            mime = %mime,
-            bytes = attachment.data.len(),
-            "matrix_post: uploading attachment to Matrix media store"
+        // Uploaded encrypted for an encrypted room, plain for the others; once per kind.
+        let file = media::Attachment::new(
+            attachment.filename.clone(),
+            mime.clone(),
+            attachment.data.clone(),
         );
-        let t_upload = std::time::Instant::now();
-        match bot
-            .client
-            .media()
-            .upload(&mime, attachment.data.clone(), None)
-            .await
-        {
-            Ok(response) => {
-                let mxc_uri = response.content_uri;
-                info!(
-                    message_id = %email.message_id,
-                    filename = %attachment.filename,
-                    mxc_uri = %mxc_uri,
-                    elapsed_ms = t_upload.elapsed().as_millis(),
-                    "matrix_post: attachment uploaded"
-                );
-                let content = if mime.type_() == mime::IMAGE {
-                    let mut info = ImageInfo::new();
-                    info.mimetype = Some(attachment.content_type.clone());
-                    info.size = Some(UInt::new_wrapping(attachment.data.len() as u64));
-                    RoomMessageEventContent::new(MessageType::Image(
-                        matrix_sdk::ruma::events::room::message::ImageMessageEventContent::plain(
-                            attachment.filename.clone(),
-                            mxc_uri,
-                        )
-                        .info(Box::new(info)),
-                    ))
-                } else {
-                    RoomMessageEventContent::new(MessageType::File(
-                        matrix_sdk::ruma::events::room::message::FileMessageEventContent::plain(
-                            attachment.filename.clone(),
-                            mxc_uri,
-                        ),
-                    ))
-                };
-
-                for room in &rooms {
-                    let txn_id = transaction_id(
-                        txn_base,
-                        room.room_id().as_str(),
-                        &format!("attachment-{idx}"),
+        for room in &rooms {
+            debug!(
+                message_id = %email.message_id,
+                filename = %attachment.filename,
+                mime = %mime,
+                bytes = attachment.data.len(),
+                room_id = %room.room_id(),
+                "matrix_post: uploading attachment to Matrix media store"
+            );
+            let t_upload = std::time::Instant::now();
+            let source = match file.upload(room).await {
+                Ok(source) => source,
+                Err(e) => {
+                    warn!(
+                        message_id = %email.message_id,
+                        filename = %attachment.filename,
+                        bytes = attachment.data.len(),
+                        room_id = %room.room_id(),
+                        elapsed_ms = t_upload.elapsed().as_millis(),
+                        error = %e,
+                        "matrix_post: failed to upload attachment to Matrix media store"
                     );
-                    if let Err(e) = send_with_retry_txn(room, content.clone(), &txn_id).await {
-                        warn!(
-                            message_id = %email.message_id,
-                            filename = %attachment.filename,
-                            room_id = %room.room_id(),
-                            error = %e,
-                            "matrix_post: failed to post attachment to room"
-                        );
-                    } else {
-                        debug!(
-                            message_id = %email.message_id,
-                            filename = %attachment.filename,
-                            room_id = %room.room_id(),
-                            "matrix_post: attachment posted"
-                        );
-                    }
+                    continue;
                 }
-            }
-            Err(e) => {
+            };
+            info!(
+                message_id = %email.message_id,
+                filename = %attachment.filename,
+                mxc_uri = %media_uri(&source),
+                encrypted = matches!(source, MediaSource::Encrypted(_)),
+                elapsed_ms = t_upload.elapsed().as_millis(),
+                "matrix_post: attachment uploaded"
+            );
+            let txn_id = transaction_id(
+                txn_base,
+                room.room_id().as_str(),
+                &format!("attachment-{idx}"),
+            );
+            // The source again right before every attempt: should encryption have been
+            // switched on since the upload, the file goes up again encrypted.
+            let content = |source| attachment_content(attachment, &mime, source);
+            if let Err(e) = media::send_content_txn(room, &file, content, &txn_id).await {
                 warn!(
                     message_id = %email.message_id,
                     filename = %attachment.filename,
-                    bytes = attachment.data.len(),
-                    elapsed_ms = t_upload.elapsed().as_millis(),
+                    room_id = %room.room_id(),
                     error = %e,
-                    "matrix_post: failed to upload attachment to Matrix media store"
+                    "matrix_post: failed to post attachment to room"
+                );
+            } else {
+                debug!(
+                    message_id = %email.message_id,
+                    filename = %attachment.filename,
+                    room_id = %room.room_id(),
+                    "matrix_post: attachment posted"
                 );
             }
         }
+    }
+}
+
+/// The event for an uploaded attachment: an image as `m.image` with its MIME type and size,
+/// anything else as a bare `m.file`; the file name as body.
+fn attachment_content(
+    attachment: &Attachment,
+    mime: &mime::Mime,
+    source: MediaSource,
+) -> RoomMessageEventContent {
+    if mime.type_() == mime::IMAGE {
+        let mut info = ImageInfo::new();
+        info.mimetype = Some(attachment.content_type.clone());
+        info.size = Some(UInt::new_wrapping(attachment.data.len() as u64));
+        RoomMessageEventContent::new(MessageType::Image(
+            ImageMessageEventContent::new(attachment.filename.clone(), source).info(Box::new(info)),
+        ))
+    } else {
+        RoomMessageEventContent::new(MessageType::File(FileMessageEventContent::new(
+            attachment.filename.clone(),
+            source,
+        )))
+    }
+}
+
+/// The mxc URI of an upload, plain or encrypted, for the log.
+fn media_uri(source: &MediaSource) -> &str {
+    match source {
+        MediaSource::Plain(uri) => uri.as_str(),
+        MediaSource::Encrypted(file) => file.url.as_str(),
     }
 }
 
@@ -365,5 +384,76 @@ mod tests {
             transaction_id(&base, room, "post"),
             transaction_id(&base, room, "attachment-0")
         );
+    }
+
+    fn content_json(attachment: &Attachment, source: MediaSource) -> serde_json::Value {
+        let mime = attachment
+            .content_type
+            .parse()
+            .unwrap_or(mime::APPLICATION_OCTET_STREAM);
+        serde_json::to_value(attachment_content(attachment, &mime, source)).unwrap()
+    }
+
+    fn attachment(filename: &str, content_type: &str) -> Attachment {
+        Attachment {
+            filename: filename.to_owned(),
+            content_type: content_type.to_owned(),
+            data: vec![7; 1234],
+        }
+    }
+
+    fn plain() -> MediaSource {
+        MediaSource::Plain("mxc://example.org/abc".into())
+    }
+
+    #[test]
+    fn attachments_in_a_plain_room_look_as_before() {
+        assert_eq!(
+            content_json(&attachment("photo.jpg", "image/jpeg"), plain()),
+            serde_json::json!({
+                "msgtype": "m.image",
+                "body": "photo.jpg",
+                "url": "mxc://example.org/abc",
+                "info": { "mimetype": "image/jpeg", "size": 1234 }
+            })
+        );
+        // anything else, audio and video too, a bare m.file
+        for (name, content_type) in [
+            ("minutes.pdf", "application/pdf"),
+            ("voice.mp3", "audio/mpeg"),
+            ("clip.mp4", "video/mp4"),
+            ("odd.bin", "not a mime type"),
+        ] {
+            assert_eq!(
+                content_json(&attachment(name, content_type), plain()),
+                serde_json::json!({
+                    "msgtype": "m.file",
+                    "body": name,
+                    "url": "mxc://example.org/abc"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn attachments_in_an_encrypted_room_carry_the_key_not_a_url() {
+        let file = serde_json::from_value(serde_json::json!({
+            "url": "mxc://example.org/enc",
+            "key": {
+                "kty": "oct", "key_ops": ["encrypt", "decrypt"], "alg": "A256CTR",
+                "k": "qcHVMSgYg-71CauWBezXI5qkaRb0LuIy-Wx5kIaHMIA", "ext": true
+            },
+            "iv": "X85+XgHN+HEAAAAAAAAAAA",
+            "hashes": { "sha256": "5qG4fFnbbVdlAB1Q72JDKwCagV6Dbkx9uds4rSak37c" },
+            "v": "v2"
+        }))
+        .unwrap();
+        let source = MediaSource::Encrypted(Box::new(file));
+        assert_eq!(media_uri(&source), "mxc://example.org/enc");
+        let content = content_json(&attachment("photo.png", "image/png"), source);
+        assert!(content.get("url").is_none(), "{content}");
+        assert_eq!(content["file"]["url"], "mxc://example.org/enc");
+        assert_eq!(content["msgtype"], "m.image");
+        assert_eq!(content["info"]["mimetype"], "image/png");
     }
 }

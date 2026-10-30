@@ -306,6 +306,21 @@ impl Db {
         .context("spawn_blocking fail_retry")?
     }
 
+    /// Rows in the retry queue (tests).
+    #[cfg(test)]
+    pub fn retry_queue_len(&self) -> i64 {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row("SELECT COUNT(*) FROM retry_queue", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Makes every write to the retry queue fail (tests).
+    #[cfg(test)]
+    pub fn break_retry_queue(&self) {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute_batch("DROP TABLE retry_queue").unwrap();
+    }
+
     pub async fn store_route(
         &self,
         matrix_event_id: &str,
