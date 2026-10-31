@@ -306,6 +306,38 @@ impl Db {
         .context("spawn_blocking fail_retry")?
     }
 
+    /// Mails waiting in the retry queue and the creation time (Unix seconds) of the oldest,
+    /// for the status file.
+    pub async fn retry_queue_stats(&self) -> Result<(u64, Option<i64>)> {
+        self.queue_stats("SELECT COUNT(*), MIN(created_at) FROM retry_queue")
+            .await
+    }
+
+    /// Matrix replies waiting for SMTP delivery (pending or failed, still retried) and the
+    /// creation time of the oldest, for the status file.
+    pub async fn smtp_queue_stats(&self) -> Result<(u64, Option<i64>)> {
+        self.queue_stats(
+            "SELECT COUNT(*), MIN(created_at) FROM message_routes \
+             WHERE origin = 'matrix' \
+               AND (smtp_status = 'pending' OR smtp_status = 'failed') \
+               AND smtp_attempts < 10",
+        )
+        .await
+    }
+
+    async fn queue_stats(&self, sql: &'static str) -> Result<(u64, Option<i64>)> {
+        let conn = Arc::clone(&self.conn);
+        spawn_blocking(move || {
+            let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let (count, oldest) = conn.query_row(sql, [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?;
+            Ok::<(u64, Option<i64>), anyhow::Error>((count.max(0) as u64, oldest))
+        })
+        .await
+        .context("spawn_blocking queue_stats")?
+    }
+
     /// Rows in the retry queue (tests).
     #[cfg(test)]
     pub fn retry_queue_len(&self) -> i64 {
@@ -751,6 +783,28 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn queues_are_counted_with_their_oldest_item() {
+        let (_dir, db) = test_db();
+        assert_eq!(db.retry_queue_stats().await.unwrap(), (0, None));
+        assert_eq!(db.smtp_queue_stats().await.unwrap(), (0, None));
+        let before = chrono::Utc::now().timestamp();
+        db.push_retry("{}").await.unwrap();
+        db.push_retry("{}").await.unwrap();
+        let (pending, oldest) = db.retry_queue_stats().await.unwrap();
+        assert_eq!(pending, 2);
+        assert!(oldest.unwrap() >= before);
+        db.store_matrix_reply_pending("$a", "!room:example.org", "<a@x>", None, None, "{}")
+            .await
+            .unwrap();
+        accepted_route(&db, "$b", "<b@x>").await;
+        assert_eq!(
+            db.smtp_queue_stats().await.unwrap().0,
+            1,
+            "only the pending one"
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,8 @@ pub async fn imap_loop(
 ) {
     let mut reconnect_delay = Duration::from_secs(5);
     let mut attempt = 0u32;
+    // A poll cycle ends with ok or failed (below) every poll interval.
+    alive.expect_every(Duration::from_secs(config.effective_poll_interval_secs()));
 
     loop {
         alive.tick();

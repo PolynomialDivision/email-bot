@@ -11,6 +11,7 @@ use mxbot_common::{
         },
         Client, Room, RoomState,
     },
+    status,
     supervise::{supervise, supervise_ticking, Alive},
     Bot,
 };
@@ -571,21 +572,81 @@ async fn queue_for_retry(db: &Db, parsed: &ParsedEmail) -> Handled {
     }
 }
 
+/// What a round of a retry or monitor loop reports for the status file
+/// (`mxbot_common::status`): the worst thing that happened in the round.
+#[derive(Debug, PartialEq, Eq)]
+enum Round {
+    /// Nothing to do.
+    Idle,
+    Ok,
+    Failed(String),
+    /// A piece of work dropped for good.
+    GaveUp(String),
+}
+
+impl Round {
+    fn rank(&self) -> u8 {
+        match self {
+            Round::Idle => 0,
+            Round::Ok => 1,
+            Round::Failed(_) => 2,
+            Round::GaveUp(_) => 3,
+        }
+    }
+
+    /// `self` or `other`, whichever is worse (the first of two equally bad ones).
+    fn and(self, other: Round) -> Round {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    fn report(self, alive: &Alive) {
+        match self {
+            Round::Idle => alive.idle(),
+            Round::Ok => alive.ok(),
+            Round::Failed(reason) => alive.failed(reason),
+            Round::GaveUp(reason) => alive.gave_up(reason),
+        }
+    }
+}
+
+/// A queue's length and the creation time (Unix seconds) of its oldest item into the status
+/// file; a failed count leaves the last one.
+fn report_queue(name: &str, stats: Result<(u64, Option<i64>)>) {
+    match stats {
+        Ok((pending, oldest)) => status::queue(name).set_since(
+            pending,
+            oldest.map(|secs| std::time::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64)),
+        ),
+        Err(e) => debug!(queue = name, error = %e, "Could not count the queue for the status file"),
+    }
+}
+
+const RETRY_POLL: Duration = Duration::from_secs(300);
+
 async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive) {
     info!("Email retry loop: started (poll interval: 300s)");
+    alive.expect_every(RETRY_POLL);
     loop {
-        sleep(Duration::from_secs(300)).await;
+        report_queue("email retry", db.retry_queue_stats().await);
+        sleep(RETRY_POLL).await;
         alive.tick();
         debug!("Email retry loop: polling queue");
 
+        let mut round = Round::Idle;
         match db.pop_retry(10).await {
             Err(e) => {
                 error!(error = %e, "Email retry loop: failed to poll retry queue");
+                alive.failed(format!("polling the retry queue: {e:#}"));
                 continue;
             }
             Ok(items) => {
                 if items.is_empty() {
                     debug!("Email retry loop: queue empty");
+                    alive.idle();
                     continue;
                 }
                 info!(count = items.len(), "Email retry loop: processing items");
@@ -599,6 +660,8 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive
                                 "Email retry loop: corrupt payload, discarding"
                             );
                             db.ack_retry(id).await.ok();
+                            round = round
+                                .and(Round::GaveUp("a corrupt retry payload discarded".into()));
                             continue;
                         }
                     };
@@ -611,6 +674,7 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive
                             "Email retry loop: max attempts reached, dropping"
                         );
                         db.ack_retry(id).await.ok();
+                        round = round.and(Round::GaveUp("a mail dropped after 10 attempts".into()));
                         continue;
                     }
 
@@ -632,6 +696,7 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive
                                 "Email retry loop: retry succeeded"
                             );
                             db.ack_retry(id).await.ok();
+                            round = round.and(Round::Ok);
                         }
                         Err(e) => {
                             let backoff_secs = (60u64 * (1u64 << attempts.min(10))).min(3600);
@@ -648,11 +713,13 @@ async fn retry_loop(bot: Bot, db: Db, limits: config::LimitsConfig, alive: Alive
                                 "Email retry loop: retry failed, backoff {}s", backoff_secs
                             );
                             db.fail_retry(id, next_retry_at).await.ok();
+                            round = round.and(Round::Failed(format!("posting a mail: {e:#}")));
                         }
                     }
                 }
             }
         }
+        round.report(&alive);
     }
 }
 
@@ -674,17 +741,22 @@ async fn smtp_retry_loop(
         "SMTP retry loop: started"
     );
 
+    // Rounds come at least every 5 minutes (the longest sleep below).
+    alive.expect_every(Duration::from_secs(300));
     loop {
         alive.tick();
+        report_queue("smtp retry", db.smtp_queue_stats().await);
         debug!("SMTP retry loop: polling queue");
         let items = match db.get_failed_smtp_routes(10).await {
             Ok(v) => v,
             Err(e) => {
                 error!(error = %e, "SMTP retry loop: failed to fetch queue");
+                alive.failed(format!("reading the SMTP queue: {e:#}"));
                 sleep(Duration::from_secs(30)).await;
                 continue;
             }
         };
+        let mut round = Round::Idle;
 
         if !items.is_empty() {
             info!(count = items.len(), "SMTP retry loop: processing items");
@@ -704,6 +776,7 @@ async fn smtp_retry_loop(
                     db.mark_route_failed(&item.matrix_event_id, i64::MAX)
                         .await
                         .ok();
+                    round = round.and(Round::GaveUp("a corrupt SMTP payload parked".into()));
                     continue;
                 }
             };
@@ -730,6 +803,7 @@ async fn smtp_retry_loop(
                     db.mark_route_smtp_accepted(&item.matrix_event_id)
                         .await
                         .ok();
+                    round = round.and(Round::Ok);
                 }
                 Err(e) => {
                     let backoff_secs = (60u64 * (1u64 << (item.attempts as u32).min(10))).min(3600);
@@ -748,9 +822,11 @@ async fn smtp_retry_loop(
                     db.mark_route_failed(&item.matrix_event_id, next_retry_at)
                         .await
                         .ok();
+                    round = round.and(Round::Failed(format!("sending a reply by SMTP: {e:#}")));
                 }
             }
         }
+        round.report(&alive);
 
         // Sleep until the next scheduled retry, up to a 5-minute cap.
         let sleep_dur = match db.get_next_smtp_retry_at().await {
@@ -779,6 +855,8 @@ async fn smtp_retry_loop(
 
 async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, alive: Alive) {
     const NOTICE_LEASE_SECS: i64 = 300;
+    // An idle round every minute.
+    alive.expect_every(Duration::from_secs(60));
     loop {
         alive.tick();
         match db
@@ -799,6 +877,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, a
                             matrix_event_id = %notice.matrix_event_id,
                             "Delivery was confirmed after notice scheduling: suppressing notice"
                         );
+                        alive.ok();
                         continue;
                     }
                     Err(e) => {
@@ -807,6 +886,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, a
                             error = %e,
                             "Could not re-check delivery state: releasing notice claim"
                         );
+                        alive.failed(format!("re-checking a delivery: {e:#}"));
                         db.release_delivery_notice(&notice.matrix_event_id)
                             .await
                             .ok();
@@ -825,6 +905,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, a
                             error = %e,
                             "Invalid room ID for delivery notice: parking notice"
                         );
+                        alive.gave_up("a delivery notice with an invalid room ID parked");
                         db.mark_delivery_notice_sent(&notice.matrix_event_id)
                             .await
                             .ok();
@@ -837,6 +918,7 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, a
                         room_id = %room_id,
                         "Room unavailable for delivery notice: releasing claim"
                     );
+                    alive.failed("the room of a delivery notice is unavailable");
                     db.release_delivery_notice(&notice.matrix_event_id)
                         .await
                         .ok();
@@ -863,11 +945,14 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, a
                         );
                         if let Err(e) = db.mark_delivery_notice_sent(&notice.matrix_event_id).await
                         {
+                            alive.failed(format!("recording a delivery notice: {e:#}"));
                             warn!(
                                 matrix_event_id = %notice.matrix_event_id,
                                 error = %e,
                                 "Failed to persist delivery notice completion"
                             );
+                        } else {
+                            alive.ok();
                         }
                     }
                     Err(e) => {
@@ -877,15 +962,20 @@ async fn delivery_confirmation_loop(client: Client, db: Db, timeout_secs: u64, a
                             error = %e,
                             "Failed to post delivery-unconfirmed notice: releasing claim"
                         );
+                        alive.failed(format!("posting a delivery notice: {e:#}"));
                         db.release_delivery_notice(&notice.matrix_event_id)
                             .await
                             .ok();
                     }
                 }
             }
-            Ok(None) => sleep(Duration::from_secs(60)).await,
+            Ok(None) => {
+                alive.idle();
+                sleep(Duration::from_secs(60)).await;
+            }
             Err(e) => {
                 error!(error = %e, "Delivery confirmation monitor failed to claim work");
+                alive.failed(format!("claiming delivery work: {e:#}"));
                 sleep(Duration::from_secs(60)).await;
             }
         }
@@ -909,6 +999,26 @@ async fn cleanup_loop(db: Db) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_round_reports_its_worst_outcome() {
+        use super::Round;
+        assert_eq!(Round::Idle.and(Round::Ok), Round::Ok);
+        assert_eq!(
+            Round::Ok.and(Round::Failed("a".into())).and(Round::Ok),
+            Round::Failed("a".into())
+        );
+        assert_eq!(
+            Round::Failed("a".into()).and(Round::Failed("b".into())),
+            Round::Failed("a".into()),
+            "the first of two failures"
+        );
+        assert_eq!(
+            Round::Failed("a".into()).and(Round::GaveUp("dropped".into())),
+            Round::GaveUp("dropped".into())
+        );
+        assert_eq!(Round::Idle.and(Round::Idle), Round::Idle);
+    }
+
     use super::*;
 
     fn parsed_email() -> ParsedEmail {
